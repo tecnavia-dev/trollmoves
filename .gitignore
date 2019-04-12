@@ -58,3 +58,5 @@ target/
 
 #exclude trollstart for git push
 /trollstart/
+xRITDecompress
+xRITDecompress64
