@@ -27,7 +27,7 @@ import os
 import time
 from datetime import datetime
 from threading import Lock, Timer
-from six.moves.urllib.parse import urlparse
+from urlparse import urlparse
 
 import pyinotify
 

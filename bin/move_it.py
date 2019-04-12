@@ -122,6 +122,13 @@ When the script is launched, or when a section is added or updated, existing
 files matching the pattern defined in `origin` are touched in order to create a
 triggering of the chain on them. To avoid any race conditions, chain is
 executed tree seconds after the list of file is gathered.
+
+
+I Like To Move It Move It
+I Like To Move It Move It
+I Like To Move It Move It
+Ya Like To (MOVE IT!)
+
 """
 
 import bz2
@@ -134,9 +141,9 @@ import shutil
 import subprocess
 import sys
 import time
-from six.moves.configparser import ConfigParser
+from ConfigParser import ConfigParser
 from ftplib import FTP, all_errors
-from six.moves.urllib.parse import urlparse, urlunparse
+from urlparse import urlparse, urlunparse
 
 import pyinotify
 
@@ -149,8 +156,8 @@ try:
     from posttroll.publisher import NoisyPublisher
     from posttroll.message import Message
 except ImportError:
-    print("\nNOTICE! Import of posttroll failed, "
-          "messaging will not be used.\n")
+    print ("\nNOTICE! Import of posttroll failed, " +
+           "messaging will not be used.\n")
 
 
 chains = {}
@@ -212,10 +219,10 @@ def reload_config(filename):
 
     old_glob = []
 
-    for key, val in new_chains.items():
+    for key, val in new_chains.iteritems():
         identical = True
         if key in chains:
-            for key2, val2 in new_chains[key].items():
+            for key2, val2 in new_chains[key].iteritems():
                 if ((key2 not in ["notifier", "publisher"]) and
                     ((key2 not in chains[key]) or
                      (chains[key][key2] != val2))):
@@ -231,7 +238,10 @@ def reload_config(filename):
         chains[key] = val
         try:
             chains[key]["publisher"] = NoisyPublisher("move_it_" + key,
-                                                      val["publish_port"])
+                                                      val["publish_port"],
+                                                      None,
+                                                      2,
+                                                      "localhost")
         except (KeyError, NameError):
             pass
         chains[key]["notifier"] = create_notifier(val)
@@ -381,17 +391,62 @@ def bzip(origin, destination=None):
 # Mover
 
 
-def move_it(pathname, destinations, hook=None):
+def move_it(pathname, destinations, hook=None, dest_subdir="", dest_size=0):
     """Check if the file pointed by *filename* is in the filelist, and move it
     if it is.
     """
     e = None
     for dest in destinations:
+        # TA: Compute the destination using time stemp of the raw_input
+        #dest_subdir = "%Y%m%d%H%M/"
+        #dest_size = 5
+        dest_size = int(dest_size)
+
+        fname = os.path.basename(pathname)
+        dest_year  = fname[46:50]
+        dest_month = fname[50:52]
+        dest_day   = fname[52:54]
+        dest_hour  = fname[54:56]
+        dest_min   = fname[56:58]
+        import string
+        dest_subdir = string.replace(dest_subdir, "%Y", dest_year)
+        dest_subdir = string.replace(dest_subdir, "%m", dest_month)
+        dest_subdir = string.replace(dest_subdir, "%d", dest_day)
+        dest_subdir = string.replace(dest_subdir, "%H", dest_hour)
+        dest_subdir = string.replace(dest_subdir, "%M", dest_min)
+
+        # Purge directory presents
+        if fname.find("-EPI") > 0:
+            dest_list = os.listdir(dest)
+            dest_listsubdir = []
+            for dest_dir in dest_list:
+                if os.path.isdir(os.path.join(dest, dest_dir)):
+                    dest_listsubdir.append(dest_dir)
+            print "List subdir: "
+            print dest_listsubdir
+            if len(dest_listsubdir) > dest_size:
+                dest_listsubdir.sort()
+                print "Sorted: "
+                print dest_listsubdir
+                dest_todel = len(dest_listsubdir) - dest_size
+                for x in range(0, dest_todel):
+                   dest_dirtodel = os.path.join(dest, dest_listsubdir[x])
+                   print "Todel " + dest_dirtodel
+                   shutil.rmtree(dest_dirtodel)
+
+
+
+        if dest_subdir != "":
+            dest = os.path.join(dest, dest_subdir)
+
+
+        if not os.path.exists(dest):
+            os.makedirs(dest, 0777)
         LOGGER.debug("Copying to: " + dest)
         dest_url = urlparse(dest)
         try:
             mover = MOVERS[dest_url.scheme]
-        except KeyError:
+        except KeyError, e:
             LOGGER.error("Unsupported protocol '" + str(dest_url.scheme)
                          + "'. Could not copy " + pathname + " to "
                          + str(dest))
@@ -400,7 +455,17 @@ def move_it(pathname, destinations, hook=None):
             mover(pathname, dest_url).copy()
             if hook:
                 hook(pathname, dest_url)
-        except Exception:
+
+            if fname.find("-EPI") > 0:
+                dest_epistr = "[REF]\r\n"
+                dest_epistr += "SourcePath = " + dest + "\r\n"
+                dest_epistr += "FileName = " + fname + "\r\n"
+                dest_epifile = dest + "/../../ref/" + fname
+                dest_epifilefp = open(dest_epifile, "w")
+                dest_epifilefp.write(dest_epistr)
+                dest_epifilefp.close()
+
+        except Exception, e:
             LOGGER.exception("Something went wrong during copy of "
                              + pathname + " to " + str(dest))
             continue
@@ -483,11 +548,10 @@ class FtpMover(Mover):
         else:
             connection.login()
 
-        file_obj = open(self.origin, 'rb')
+        file_obj = file(self.origin, 'rb')
         connection.cwd(self.destination.path)
         connection.storbinary('STOR ' + os.path.basename(self.origin),
                               file_obj)
-        file_obj.close()
 
         try:
             connection.quit()
@@ -566,8 +630,11 @@ def create_notifier(attrs):
                 new_path = pathname
             try:
                 move_it(new_path, attrs["destinations"],
-                        attrs.get("copy_hook", None))
-            except Exception:
+                        attrs.get("copy_hook", None),
+                        attrs["destination_subdir"],
+                        attrs["destination_size"]
+                        )
+            except Exception, e:
                 LOGGER.error("Something went wrong during copy of "
                              + pathname)
             else:
@@ -577,7 +644,7 @@ def create_notifier(attrs):
                         if attrs["delete_hook"]:
                             attrs["delete_hook"](pathname)
                         LOGGER.debug("Removed " + pathname)
-                    except OSError as e__:
+                    except OSError, e__:
                         if e__.errno == 2:
                             LOGGER.debug("Already deleted: " + pathname)
                         else:
@@ -587,7 +654,7 @@ def create_notifier(attrs):
             if pathname != new_path:
                 try:
                     os.remove(new_path)
-                except OSError as e__:
+                except OSError, e__:
                     if e__.errno == 2:
                         pass
                     else:
@@ -601,7 +668,7 @@ def create_notifier(attrs):
 
 
 def terminate(chains):
-    for chain in chains.values():
+    for chain in chains.itervalues():
         chain["notifier"].stop()
         if "publisher" in chain:
             chain["publisher"].stop()
