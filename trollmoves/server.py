@@ -330,9 +330,10 @@ def create_notifier(attrs, publisher):
 
         return tnotifier, fun
     else:
-        thread = Thread(target = pollingScanDir, args = (opath, 20, fun))
-        #thread.start()
+        #thread = Thread(target = pollingScanDir, args = (opath, 20, fun))
+        thread = PollerManager(opath, fun)
 
+        #thread.start()
         return thread, scanMode, fun
 
 
@@ -745,7 +746,8 @@ def process_old_files(pattern, fun):
 def terminate(chains, publisher=None):
     for chain in chains.values():
         if chain["notifier_scanmode"] == "polling":
-            chain["notifier"].join()
+            #chain["notifier"].join()
+            chain["notifier"].stop()
         else:
             chain["notifier"].stop()
 
@@ -760,3 +762,54 @@ def terminate(chains, publisher=None):
           " See you soon on pytroll.org!")
     time.sleep(1)
     sys.exit(0)
+
+
+class PollerManager(Thread):
+    """Manage scan Polling thread.
+    """
+
+    def __init__(self, opath, fun):
+        Thread.__init__(self)
+
+        self._loop = True
+        self.scanPath = opath
+        self._fun = fun
+        self.timeSleepNoWork = 20
+        self._deleter = Deleter()
+
+    def start(self):
+        self._deleter.start()
+        Thread.start(self)
+
+    def run(self):
+        listBefore = dict([(f, None) for f in os.listdir(self.scanPath)])
+        if listBefore: print "Before: ", ", ".join(listBefore)
+        timeSleep = self.timeSleepNoWork
+        while self._loop:
+            try:
+                time.sleep(timeSleep)
+                listAfter = dict([(f, None) for f in os.listdir(self.scanPath)])
+                listAdded = [f for f in listAfter if not f in listBefore]
+                # removed = [f for f in before if not f in after]
+                if listAdded: print "Added: ", ", ".join(listAdded)
+                if listAdded.__len__() > 0:
+                    print "Found " + str(listAdded.__len__()) + " files"
+                    for key in listAdded:
+                        self._fun(os.path.join(self.scanPath, key))
+
+                    timeSleep = 0
+                else:
+                    timeSleep = self.timeSleepNoWork
+
+                listBefore = listAfter
+            except:
+                #restart it
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                LOGGER.debug('Poller thread exception type: %s', str(exc_type))
+                LOGGER.debug('Poller thread exception value: %s', str(exc_value))
+                pass
+
+    def stop(self):
+        """Stop the poller manager."""
+        self._loop = False
+        self._deleter.stop()
