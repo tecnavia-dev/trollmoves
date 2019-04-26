@@ -58,7 +58,3 @@ target/
 
 #exclude trollstart for git push
 /trollstart/
-/PyToCh_config/
-xRITDecompress
-xRITDecompress64
-setup_PyToCh.py
