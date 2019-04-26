@@ -42,8 +42,8 @@ from posttroll.subscriber import Subscriber
 
 from trollmoves import heartbeat_monitor
 
-from trollmoves.util import unpack, util_purgeDir, util_generateRef, util_touchRef
-
+import utils
+from trollmoves.utils import unpack
 
 LOGGER = logging.getLogger(__name__)
 
@@ -288,10 +288,10 @@ def request_push(msg, destination, login, publisher=None, **kwargs):
             # Purge directory presents and generate Ref
             if kwargs["destination_size"] is not None and kwargs["destination_subdir"] is not None:
                 if msg.data['uid'].find("-EPI") > 0:
-                    util_purgeDir(destinationBase, int(kwargs["destination_size"]))
-                    util_generateRef(destination, msg.data['uid'], destination + "/../../ref")
+                    utils.purgeDir(destinationBase, int(kwargs["destination_size"]))
+                    utils.generateRef(destination, msg.data['uid'], destination + "/../../ref")
                 else:
-                    util_touchRef(destination, msg.data['uid'], destination + "/../../ref")
+                    utils.touchRef(destination, msg.data['uid'], destination + "/../../ref")
 
 
             if publisher:
@@ -639,7 +639,6 @@ class CircularLog(object):
         current_len = len(cache_log)
         if current_len > (int(max_size) + self.header_len):
             # remove elems from the beginning
-            #TODO: sistemare, nel caso header len non sia 2 forse non funziona
             rightdel = current_len-int(max_size)
             del cache_log[self.header_len:rightdel]
             cache_log[0] = str((int(max_size)-1+self.header_len))

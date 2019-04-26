@@ -48,7 +48,7 @@ from posttroll.message import Message
 from posttroll.publisher import get_own_ip
 from trollsift import globify, parse
 
-from trollmoves.util import unpack
+from trollmoves.utils import unpack
 
 LOGGER = logging.getLogger(__name__)
 
