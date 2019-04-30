@@ -803,10 +803,9 @@ class PollerManager(Thread):
 
                 listBefore = listAfter
             except:
-                #restart it
                 exc_type, exc_value, exc_traceback = sys.exc_info()
-                LOGGER.debug('Poller thread exception type: %s', str(exc_type))
-                LOGGER.debug('Poller thread exception value: %s', str(exc_value))
+                exceptionInfo = str(exc_type) + ": " + str(exc_value)
+                LOGGER.debug('Poller thread exception %s', exceptionInfo)
                 pass
 
     def stop(self):

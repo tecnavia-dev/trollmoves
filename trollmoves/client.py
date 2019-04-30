@@ -45,7 +45,18 @@ from trollmoves import heartbeat_monitor
 import utils
 from trollmoves.utils import unpack
 
+try:
+    from trollmonitor.adapter import MonitorAdapter
+except ImportError:
+    pass
+
 LOGGER = logging.getLogger(__name__)
+
+#initialize monitor adapter used for trollmonitor log
+if 'trollmonitor.adapter' in sys.modules:
+    MONITORLOG = MonitorAdapter(LOGGER, {'prodid' : "init"})
+else:
+    MONITORLOG = None
 
 file_cache = deque(maxlen=11000)
 cache_lock = Lock()
@@ -164,32 +175,38 @@ class Listener(Thread):
 
             while self.running:
                 # Loop for restart.
+                try:
 
-                LOGGER.debug("Starting listener %s", str(self.address))
-                self.create_subscriber()
+                    LOGGER.debug("Starting listener %s", str(self.address))
+                    self.create_subscriber()
 
-                for msg in self.subscriber(timeout=1):
-                    if not self.running:
-                        break
+                    for msg in self.subscriber(timeout=1):
+                        if not self.running:
+                            break
 
-                    if self.restart_event.is_set():
-                        self.restart_event.clear()
-                        self.stop()
-                        self.running = True
-                        break
+                        if self.restart_event.is_set():
+                            self.restart_event.clear()
+                            self.stop()
+                            self.running = True
+                            break
 
-                    if msg is None:
-                        continue
+                        if msg is None:
+                            continue
 
-                    LOGGER.debug("Receiving (SUB) %s", str(msg))
+                        LOGGER.debug("Receiving (SUB) %s", str(msg))
 
-                    beat_monitor(msg)
-                    if msg.type == "beat":
-                        continue
+                        beat_monitor(msg)
+                        if msg.type == "beat":
+                            continue
 
-                    self.callback(msg, *self.cargs, **self.ckwargs)
+                        self.callback(msg, *self.cargs, **self.ckwargs)
 
-                LOGGER.debug("Exiting listener %s", str(self.address))
+                    LOGGER.debug("Exiting listener %s", str(self.address))
+                except:
+                    exc_type, exc_value, exc_traceback = sys.exc_info()
+                    exceptionInfo = str(exc_type) + ": " + str(exc_value)
+                    LOGGER.debug('Client thread listener exception %s', exceptionInfo)
+                    pass
 
     def stop(self):
         '''Stop subscriber and delete the instance
@@ -491,7 +508,12 @@ class PushRequester(object):
                         except MessageError as err:
                             LOGGER.error('Message error: %s', str(err))
                             break
-                        LOGGER.debug("Receiving (REQ) %s", str(rep))
+                        if MONITORLOG is not None:
+                            # checkpoint
+                            mlog_message = "Receiving (REQ) " + str(rep)
+                            MONITORLOG.debug(mlog_message)
+                        else:
+                            LOGGER.debug("Receiving (REQ) %s", str(rep))
                         self.failures = 0
                         self.jammed = False
                         return rep
@@ -605,7 +627,12 @@ class CircularLog(object):
         tmp_pos = self.header_len-1
         tmp_list.append(str(tmp_pos)) # write the header: it contains the current write position and max size
         tmp_list.append(str(max_size)) # write the header: it contains the current write position and max size
-        open(log_filename, 'wr').write('\n'.join(tmp_list)) # write the file
+        try:
+            open(log_filename, 'wr').write('\n'.join(tmp_list)) # write the file
+        except:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            exceptionInfo = str(exc_type) + ": " + str(exc_value)
+            LOGGER.debug('Error writing client processed log %s', exceptionInfo)
 
     def circular_log_load(self, max_size):
         """ Load the circular log file cache updating max size
@@ -627,24 +654,29 @@ class CircularLog(object):
         cache_log[1] = str(max_size)
         current_pos = int(cache_log[0])
         current_len = len(cache_log)
-        if current_len > (int(max_size)+self.header_len):
-            # remove elems after current position
-            leftdel = current_pos+1
-            tmpdel = ( (current_len-self.header_len)-int(max_size))+current_pos
-            endright = current_len-1
-            rightdel = min(tmpdel,endright)
-            rightdel += 1
-            del cache_log[leftdel:rightdel]
-            modified = True
-        current_len = len(cache_log)
-        if current_len > (int(max_size) + self.header_len):
-            # remove elems from the beginning
-            rightdel = current_len-int(max_size)
-            del cache_log[self.header_len:rightdel]
-            cache_log[0] = str((int(max_size)-1+self.header_len))
-            modified = True
-        if modified:
-            open(self.filename, 'wr').write('\n'.join(cache_log))
+        try:
+            if current_len > (int(max_size)+self.header_len):
+                # remove elems after current position
+                leftdel = current_pos+1
+                tmpdel = ( (current_len-self.header_len)-int(max_size))+current_pos
+                endright = current_len-1
+                rightdel = min(tmpdel,endright)
+                rightdel += 1
+                del cache_log[leftdel:rightdel]
+                modified = True
+            current_len = len(cache_log)
+            if current_len > (int(max_size) + self.header_len):
+                # remove elems from the beginning
+                rightdel = current_len-int(max_size)
+                del cache_log[self.header_len:rightdel]
+                cache_log[0] = str((int(max_size)-1+self.header_len))
+                modified = True
+            if modified:
+                open(self.filename, 'wr').write('\n'.join(cache_log))
+        except:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            exceptionInfo = str(exc_type) + ": " + str(exc_value)
+            LOGGER.debug('Error updating client processed log %s', exceptionInfo)
         return cache_log
 
     def insert_element(self, uid):
@@ -666,6 +698,11 @@ class CircularLog(object):
         if len(self.log_list)>(maxlen+self.header_len):
             # Remove the last elem if max length already reached
             del self.log_list[(maxlen+self.header_len):]
-        open(self.filename, 'wr').write('\n'.join(self.log_list))
+        try:
+            open(self.filename, 'wr').write('\n'.join(self.log_list))
+        except:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            exceptionInfo = str(exc_type) + ": " + str(exc_value)
+            LOGGER.debug('Error inserting element in client processed log %s', exceptionInfo)
 
 
