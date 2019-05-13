@@ -186,8 +186,13 @@ class Listener(Thread):
                     beat_monitor(msg)
                     if msg.type == "beat":
                         continue
-
-                    self.callback(msg, *self.cargs, **self.ckwargs)
+                    try:
+                        self.callback(msg, *self.cargs, **self.ckwargs)
+                    except:
+                        exc_type, exc_value, exc_traceback = sys.exc_info()
+                        exceptionInfo = str(exc_type) + ": " + str(exc_value)
+                        LOGGER.debug('Client thread listener exception %s', exceptionInfo)
+                        pass
 
                 LOGGER.debug("Exiting listener %s", str(self.address))
 
