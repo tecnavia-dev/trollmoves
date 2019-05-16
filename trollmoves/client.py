@@ -337,6 +337,9 @@ def reload_config(filename, chains, callback=request_push, pub_instance=None):
 
     new_chains = read_config(filename)
 
+    #vg
+    # initialize log file for processed segments
+    # TODO: make it optional
     circular_log_filename = "/tmp/move_client_circular_log.txt"
     circular_log_size = 11000
     # setup new chains
@@ -368,6 +371,7 @@ def reload_config(filename, chains, callback=request_push, pub_instance=None):
 
         chains[key].setdefault("listeners", {})
 
+        #vg
         # Load circular log file configurations
         # Use circualr log if procfile_log is defined or use_processed_log is true
         if "procfile_log" not in chains[key]:

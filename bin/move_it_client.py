@@ -139,6 +139,13 @@ if __name__ == '__main__':
     LOGGER.addHandler(fh)
     LOGGER = logging.getLogger('move_it_client')
 
+    # test
+    from trollmonitor.handlers import MonitorHandler
+    #TODO add arguments to monitor handler constructor
+    #mh = MonitorHandler()
+    #LOGGER.addHandler(mh)
+    #
+
     pyinotify.log.handlers = [fh]
 
     LOGGER.info("Starting up.")
