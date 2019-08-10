@@ -46,7 +46,7 @@ from trollsift import globify, parse, Parser
 from trollmoves import heartbeat_monitor
 from trollmoves.utils import get_local_ips
 from trollmoves.utils import gen_dict_extract, translate_dict, translate_dict_value
-from trollmoves.utils import xrit, is_epilogue, purge_dir, generate_ref, trigger_ref
+from trollmoves.utils import xrit, is_epilogue, purge_dir, generate_ref, trigger_ref, bzip
 
 LOGGER = logging.getLogger(__name__)
 
@@ -210,12 +210,28 @@ def unpack_tar(filename, delete=False, unpack_prog=None):
 def unpack_xrit(filename, delete=False, unpack_prog="./xRITDecompress"):
     """Unpack xrit files"""
     destination = os.path.dirname(filename)
-    expected = xrit(filename, destination, cmd=unpack_prog)
+    try:
+        expected = xrit(filename, destination, cmd=unpack_prog)
+    except:
+        LOGGER.exception("Couldn't unpack_xrit file %s", sys.exc_info()[0])
+        return []
     if delete:
         os.remove(filename)
     return expected
 
-unpackers = {'tar': unpack_tar, 'xrit': unpack_xrit}
+def unpack_bz2(filename, delete=False, unpack_prog=None):
+    """Unpack bz2 files"""
+    destination = os.path.dirname(filename)
+    try:
+        expected = bzip(filename, destination)
+    except:
+        LOGGER.exception("Couldn't unpack_bz2 file %s", sys.exc_info()[0])
+        return []
+    if delete:
+        os.remove(filename)
+    return expected
+
+unpackers = {'tar': unpack_tar, 'xrit': unpack_xrit, 'bz2': unpack_bz2}
 
 
 def already_received(msg, processedlog=None):
@@ -262,7 +278,15 @@ def create_push_req_message(msg, destination, login):
 def create_destination_dir(msg, destination, destination_subdir=None):
     """Compute destination dir adding the destination subdirectory and applying additional function"""
     if destination_subdir is not None:
-        new_dest = os.path.join(destination, msg.data['nominal_time'].strftime(destination_subdir))
+        # FIXME: Apply real align() function as for trollstalker custom variables
+        # If %M|align(10) in destination_subdir: round minutes to the previous 10 minutes
+        if destination_subdir.find("%M|align(10)"):
+            destination_subdir = destination_subdir.replace("%M|align(10)", "%M")
+            destination_time = msg.data['nominal_time'].strftime(destination_subdir)
+            destination_time = destination_time[:len(destination_time)-1] + "0"
+            new_dest = os.path.join(destination, destination_time)
+        else:
+            new_dest = os.path.join(destination, msg.data['nominal_time'].strftime(destination_subdir))
     return new_dest
 
 
@@ -325,7 +349,6 @@ def generate_ref_file(msg, destination, ref_file_pattern, ref_segment_pattern):
 def trigger_ref_file(msg, destination, ref_file_pattern, ref_segment_pattern):
     ref_filename = compose_ref_filename(ref_file_pattern, msg.data['uid'], ref_segment_pattern)
     if ref_filename is not None:
-        LOGGER.debug("Retriggering reference file, segment received late: " + str(msg.data["uid"]))
         trigger_ref(destination, ref_filename)
 
 
