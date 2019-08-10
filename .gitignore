@@ -64,3 +64,6 @@ nosetests.xml
 
 # vi / vim swp files
 *.swp
+
+#exclude trollstart for git push
+/trollstart/
