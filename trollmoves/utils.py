@@ -212,6 +212,15 @@ def generate_ref(dest_dir, filename, ref_file):
             ref_file: string
                 reference file full path
     """
+    # if ref directory doesn't exist create it
+    pos = ref_file.rfind("/")
+    ref_dir = ref_file[0:pos]
+    if not os.path.exists(ref_dir):
+        try:
+            os.makedirs(ref_dir)
+        except OSError:
+            pass
+    # create ref file
     dest_epistr = "[REF]\r\n"
     dest_epistr += "SourcePath = " + dest_dir + "\r\n"
     dest_epistr += "FileName = " + filename + "\r\n"
