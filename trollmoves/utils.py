@@ -216,6 +216,15 @@ def generate_ref(dest_dir, filename, ref_file, filter=None):
             filter:
                 filter to detect referenced files
     """
+    # if ref directory doesn't exist create it
+    pos = ref_file.rfind("/")
+    ref_dir = ref_file[0:pos]
+    if not os.path.exists(ref_dir):
+        try:
+            os.makedirs(ref_dir)
+        except OSError:
+            pass
+
     if filter is None:
         filter = ".*"
     if filter == "*":
