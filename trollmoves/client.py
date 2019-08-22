@@ -45,7 +45,7 @@ from trollsift import globify, parse, Parser
 
 from trollmoves import heartbeat_monitor
 from trollmoves.utils import get_local_ips
-from trollmoves.utils import gen_dict_extract, translate_dict, translate_dict_value
+from trollmoves.utils import gen_dict_extract, translate_dict, translate_dict_value, is_file_ref_generator, create_aligned_datetime_var
 from trollmoves.utils import xrit, is_epilogue, purge_dir, generate_ref, trigger_ref, bzip
 
 LOGGER = logging.getLogger(__name__)
@@ -331,28 +331,38 @@ def unpack_and_create_local_message(msg, local_dir, unpack=None, delete=False, u
         lmsg_type = msg.type
     return Message(msg.subject, lmsg_type, data=lmsg_data)
 
-def generate_ref_file(msg, destination, ref_file_pattern, ref_segment_pattern):
+def generate_ref_file(msg, destination, use_ref_file, ref_segment_pattern=None, var_pattern=None, ref_filter=None, **kwargs):
     """ Generate reference file
     
         Args:
             msg (trollmove message)
             destination (string): destination path of the file in processing
-            ref_file_pattern (string): pattern filename of reference file, including directory path
+            use_ref_file (string): pattern filename of reference file, including directory path
             ref_segment_pattern (string): segments filename format that trigger ref file generation
     """
-    ref_filename = compose_ref_filename(ref_file_pattern, msg.data['uid'], ref_segment_pattern)
-    if ref_filename is not None:
-        LOGGER.debug("Generating reference file: " + ref_filename)
-        generate_ref(destination, msg.data['uid'], ref_filename)
+    result = compose_ref_filename(use_ref_file, msg.data['uid'], ref_segment_pattern, var_pattern, ref_filter)
+    if result is not None and result['ref_filename'] is not None:
+        ref_filename = result['ref_filename']
+        if os.path.isfile(ref_filename):
+            LOGGER.debug("Triggering reference file: " + ref_filename)
+            trigger_ref(destination, ref_filename)
+        else:
+            filter = result['filter']
+            if filter is None:
+                filter = "*"
+            LOGGER.debug("Generating reference file: " + ref_filename)
+            generate_ref(destination, msg.data['uid'], ref_filename, filter)
 
 
-def trigger_ref_file(msg, destination, ref_file_pattern, ref_segment_pattern):
-    ref_filename = compose_ref_filename(ref_file_pattern, msg.data['uid'], ref_segment_pattern)
-    if ref_filename is not None:
-        trigger_ref(destination, ref_filename)
+def trigger_ref_file(msg, destination, use_ref_file, ref_segment_pattern=None, var_pattern=None, **kwargs):
+    result = compose_ref_filename(use_ref_file, msg.data['uid'], ref_segment_pattern, var_pattern)
+    if result is not None:
+        ref_filename = result['ref_filename']
+        if ref_filename:
+            trigger_ref(destination, ref_filename)
 
 
-def compose_ref_filename(ref_pattern, segment, segment_pattern):
+def compose_ref_filename(ref_pattern, segment, segment_pattern, var_pattern, ref_filter=None):
     """ Compute filename of Reference file
 
         Args:
@@ -360,12 +370,14 @@ def compose_ref_filename(ref_pattern, segment, segment_pattern):
             segment (string): segment name that triggered ref file generation
             segment_pattern (string): pattern of the segment that triggers ref file generation
                                       used to retrieve information for the ref pattern filename
+            var_pattern (string): pattern rules to apply special function to segment_pattern variables
 
         Returns:
-            (string): filename of the ref file
+            (dict) ref_filename : filename of the ref file
+                   filter: filter for referenced files
             None: if ref_filename cannot be computed
     """
-    ref_filename = None
+    result = None
     if segment_pattern is None:
         # default segment pattern
         segment_pattern = "H-000-{series:_<6s}-{platform_name:4s}________-{channel:_<9s}-{segment:_<9s}-{nominal_time:%Y%m%d%H%M}-{compress_flag:_<1s}_"
@@ -374,10 +386,41 @@ def compose_ref_filename(ref_pattern, segment, segment_pattern):
         segment_info = parse(segment_pattern, segment)
         if "segment" in segment_info:
             segment_info['segment'] = 'EPI'
+
+        # try to detect time align functionts and elaborate them
+        # if defined in var_pattern configuration
+        aligned = create_aligned_datetime_var(var_pattern,segment_info)
+        if aligned is not None:
+            segment_info.update(aligned)
         ref_filename = ref_parser.compose(segment_info)
+
+        # Compute referenced files filter
+        result = dict()
+        result['filter'] = None
+        result['ref_filename'] = ref_filename
+        if ref_filter is not None:
+            if "{" in ref_filter:
+                start_pos = ref_filter.find("{")
+                if start_pos >= 0:
+                    end_pos = ref_filter.find("}", start_pos)
+                if end_pos >= 0:
+                    filter_var = ref_filter[start_pos+1:end_pos]
+                    if filter_var in segment_info:
+                        replace_var = segment_info[filter_var]
+                        if end_pos+1 >= len(ref_filter):
+                            result['filter'] = ref_filter[0:start_pos] + replace_var
+                        else:
+                            result['filter'] = ref_filter[0:start_pos] + replace_var + ref_filter[end:]
+            if ref_filter == "use_ref_file":
+                result['filter'] = segment
+            if result['filter'] is None:
+                # something didn't work with the replacement
+                result['filter'] = ref_filter
+
     except ValueError:
         LOGGER.info("File doesn't match ref file pattern")
-    return ref_filename
+
+    return result
 
 
 def make_uris(msg, destination, login=None):
@@ -455,21 +498,24 @@ def request_push(msg, destination, login, publisher=None, unpack=None, delete=Fa
             LOGGER.exception("Couldn't unpack %s", str(response))
             return
 
-        if is_epilogue(msg.data["uid"]):
-            #It is an epilogue segment
-            if 'destination_subdir' in kwargs:
-                #If destination subdir is defined, purge the older subdirs
-                destination_size = kwargs['destination_size'] if 'destination_size' in kwargs else 20
-                purge_dir(destination_base, int(destination_size))
+        # If destination subdir is defined, purge the older subdirs
+        if 'destination_subdir' in kwargs:
+            destination_size = kwargs['destination_size'] if 'destination_size' in kwargs else 20
+            if destination_size <= 0:
+                destination_size = 20
+            purge_dir(destination_base, int(destination_size))
+
+        if "generate_ref" in kwargs and is_file_ref_generator(msg.data["uid"], kwargs["generate_ref"]):
+            # The uid file should trigger generation of ref file
             if "use_ref_file" in kwargs:
                 #If ref mode is defined generate the REF file
                 ref_segment_pattern = kwargs["ref_segment_pattern"] if "ref_segment_pattern" in kwargs else None
-                generate_ref_file(msg, destination, kwargs['use_ref_file'], ref_segment_pattern)
+                generate_ref_file(msg, destination, **kwargs)
         else:
             if "use_ref_file" in kwargs:
                 #If ref mode is definied and file is not epilogue: retrigger the ref file
                 ref_segment_pattern = kwargs["ref_segment_pattern"] if "ref_segment_pattern" in kwargs else None
-                trigger_ref_file(msg, destination, kwargs['use_ref_file'], ref_segment_pattern)
+                trigger_ref_file(msg, destination, **kwargs)
 
         if publisher:
             lmsg = make_uris(lmsg, destination, login)

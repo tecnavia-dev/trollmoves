@@ -27,6 +27,8 @@ import os
 import shutil
 import subprocess
 import traceback
+import re
+import datetime as dt
 from urlparse import urlparse, urlunparse
 
 
@@ -201,7 +203,7 @@ def purge_dir(dir_base, destination_size):
         LOGGER.debug("Purging subdir: No dir to purge")
     return deleted_count
 
-def generate_ref(dest_dir, filename, ref_file):
+def generate_ref(dest_dir, filename, ref_file, filter=None):
     """ Generate reference file
 
         Args:
@@ -211,16 +213,36 @@ def generate_ref(dest_dir, filename, ref_file):
                 referenced file name
             ref_file: string
                 reference file full path
+            filter:
+                filter to detect referenced files
     """
+    if filter is None:
+        filter = ".*"
+    if filter == "*":
+        filter = ".*"
+    pos = filename.find(".bz2")
+    # remove extension from filename
+    if pos >= 0:
+        filename = filename[:pos]
     dest_epistr = "[REF]\r\n"
     dest_epistr += "SourcePath = " + dest_dir + "\r\n"
     dest_epistr += "FileName = " + filename + "\r\n"
+    dest_epistr += "filter = " + filter + "\r\n"
     dest_epifilefp = open(str(ref_file), "w")
     dest_epifilefp.write(dest_epistr)
     dest_epifilefp.close()
     return ref_file
 
-def trigger_ref(dest_dir, ref_filename):
+
+def generate_ref_content(content, ref_file):
+    # Generate ref file writing content string inside
+    dest_epifilefp = open(str(ref_file), "w")
+    dest_epifilefp.write(content)
+    dest_epifilefp.close()
+    return ref_file
+
+
+def trigger_ref_old(dest_dir, ref_filename):
     """ Trigger reference file: only if epilogue segment is present in data
 
         Args:
@@ -240,6 +262,23 @@ def trigger_ref(dest_dir, ref_filename):
             os.remove(dest_epifile)
             generate_ref(dest_dir, dest_file, ref_filename)
 
+def trigger_ref(dest_dir, ref_filename):
+    """ Trigger reference file if it already exists
+
+        Args:
+            dest_dir (string): referenced directory - where satellite data are stored/decompressed
+            ref_filename (string): filename and path of the ref file
+    """
+    if ref_filename is not None:
+        if os.path.isfile(ref_filename):
+            #touch the ref file
+            LOGGER.debug("Retrigger reference file: " + ref_filename)
+            ref_file_f = open(ref_filename, "r")
+            read_ref = ref_file_f.read()
+            ref_file_f.close()
+            os.remove(ref_filename)
+            generate_ref_content(read_ref, ref_filename)
+
 
 def is_epilogue(filename):
     """ Check if filename is an epilogue segment
@@ -247,3 +286,104 @@ def is_epilogue(filename):
     if filename.find("-EPI") > 0:
         return True
     return False
+
+
+def is_file_ref_generator(filename, generate_ref):
+    """
+    Check if the filename triggers generation of ref file
+    :param filename: name of the file received
+    :param generate_ref: pattern describing the file should trigger ref file generation
+                        if "*" all files trigger ref file generation
+    :return: True if ref file should be generated
+             False if ref file should not be generated
+    """
+    if generate_ref == "*":
+        return True
+    else:
+        result = True if filename.find(generate_ref) >= 0 else False
+        return result
+    
+    
+def create_aligned_datetime_var(var_pattern, info_dict):
+    """
+    uses *var_patterns* like "{time:%Y%m%d%H%M|align(15)}"
+    to new datetime including support for temporal
+    alignment (Ceil/Round a datetime object to a multiple of a timedelta.
+    Useful to equalize small time differences in name of files
+    belonging to the same timeslot)
+    """
+    res_dict = None
+    
+    if var_pattern is None:
+        return None
+    
+    mtch = re.match(
+        '{(.*?)(!(.*?))?(\\:(.*?))?(\\|(.*?))?}',
+        var_pattern)
+
+    if mtch is None:
+        return None
+
+    # parse date format pattern
+    key = mtch.groups()[0]
+    # format_spec = mtch.groups()[4]
+    transform = mtch.groups()[6]
+    date_val = info_dict[key]
+
+    if not isinstance(date_val, dt.datetime):
+        return None
+
+    # only for datetime types
+    res = date_val
+    if transform:
+        align_params = _parse_align_time_transform(transform)
+        if align_params:
+            res = align_time(
+                date_val,
+                dt.timedelta(minutes=align_params[0]),
+                dt.timedelta(minutes=align_params[1]),
+                align_params[2])
+    if res:
+        res_dict = {key : res}
+    return res_dict
+
+def _parse_align_time_transform(transform_spec):
+    """
+    Parse the align-time transformation string "align(15,0,-1)"
+    and returns *(steps, offset, intv_add)*
+    """
+    match = re.search('align\\((.*)\\)', transform_spec)
+    if match:
+        al_args = match.group(1).split(',')
+        steps = int(al_args[0])
+        if len(al_args) > 1:
+            offset = int(al_args[1])
+        else:
+            offset = 0
+        if len(al_args) > 2:
+            intv_add = int(al_args[2])
+        else:
+            intv_add = 0
+        return (steps, offset, intv_add)
+    else:
+        return None
+
+
+def align_time(input_val, steps=dt.timedelta(minutes=5),
+               offset=dt.timedelta(minutes=0), intervals_to_add=0):
+    """
+    Ceil/Round a datetime object to a multiple of a timedelta.
+    Useful to equalize small time differences in name of files
+    belonging to the same timeslot
+    """
+    try:
+        stepss = steps.total_seconds()
+    # Python 2.6 compatibility hack
+    except AttributError:
+        stepss = steps.days * 86400. + \
+            steps.seconds + steps.microseconds * 1e-6
+    val = input_val - offset
+    vals = (val - val.min).seconds
+    result = val - dt.timedelta(seconds=(vals - (vals // stepss) * stepss))
+    result = result + (intervals_to_add * steps)
+    return result
