@@ -203,7 +203,25 @@ def purge_dir(dir_base, destination_size):
         LOGGER.debug("Purging subdir: No dir to purge")
     return deleted_count
 
-def generate_ref(dest_dir, filename, ref_file, filter=None):
+
+def purge_files(dir_base, destination_size):
+    files_list = [f for f in os.listdir(dir_base) if os.path.isfile(os.path.join(dir_base,f))]
+    deleted_count = 0
+    if len(files_list) > destination_size:
+        files_list.sort()
+        dest_todel = len(files_list) - destination_size
+        for x in range(0, dest_todel):
+            dest_dirtodel = os.path.join(dir_base, files_list[x])
+            try:
+                os.remove(dest_dirtodel)
+            except OSError:
+                pass
+            deleted_count += 1
+            LOGGER.debug("Purging files from " + str(dest_dirtodel))
+    return deleted_count
+
+
+def generate_ref(dest_dir, filename, ref_file, filter=None, ref_size=None):
     """ Generate reference file
 
         Args:
@@ -224,6 +242,11 @@ def generate_ref(dest_dir, filename, ref_file, filter=None):
             os.makedirs(ref_dir)
         except OSError:
             pass
+
+    # if ref_size is set, purge reference files
+    if ref_size is not None:
+        if os.path.exists(ref_dir):
+            purge_files(ref_dir, int(ref_size))
 
     if filter is None:
         filter = ".*"

@@ -46,7 +46,7 @@ from trollsift import globify, parse, Parser
 from trollmoves import heartbeat_monitor
 from trollmoves.utils import get_local_ips
 from trollmoves.utils import gen_dict_extract, translate_dict, translate_dict_value, is_file_ref_generator, create_aligned_datetime_var
-from trollmoves.utils import xrit, is_epilogue, purge_dir, generate_ref, trigger_ref, bzip
+from trollmoves.utils import xrit, is_epilogue, purge_dir, purge_files, generate_ref, trigger_ref, bzip
 
 LOGGER = logging.getLogger(__name__)
 
@@ -331,7 +331,7 @@ def unpack_and_create_local_message(msg, local_dir, unpack=None, delete=False, u
         lmsg_type = msg.type
     return Message(msg.subject, lmsg_type, data=lmsg_data)
 
-def generate_ref_file(msg, destination, use_ref_file, ref_segment_pattern=None, var_pattern=None, ref_filter=None, **kwargs):
+def generate_ref_file(msg, destination, use_ref_file, ref_segment_pattern=None, var_pattern=None, ref_filter=None, ref_size=None, **kwargs):
     """ Generate reference file
     
         Args:
@@ -351,7 +351,7 @@ def generate_ref_file(msg, destination, use_ref_file, ref_segment_pattern=None, 
             if filter is None:
                 filter = "*"
             LOGGER.debug("Generating reference file: " + ref_filename)
-            generate_ref(destination, msg.data['uid'], ref_filename, filter)
+            generate_ref(destination, msg.data['uid'], ref_filename, filter, ref_size)
 
 
 def trigger_ref_file(msg, destination, use_ref_file, ref_segment_pattern=None, var_pattern=None, **kwargs):
@@ -504,6 +504,9 @@ def request_push(msg, destination, login, publisher=None, unpack=None, delete=Fa
             if destination_size <= 0:
                 destination_size = 20
             purge_dir(destination_base, int(destination_size))
+        elif "destination_size" in kwargs:
+            # If destination_size is defined but there are no destination subdir, purge the destination files
+            purge_files(destination, int(kwargs['destination_size']))
 
         if "generate_ref" in kwargs and is_file_ref_generator(msg.data["uid"], kwargs["generate_ref"]):
             # The uid file should trigger generation of ref file
