@@ -205,13 +205,14 @@ def purge_dir(dir_base, destination_size):
 
 
 def purge_files(dir_base, destination_size):
-    files_list = [f for f in os.listdir(dir_base) if os.path.isfile(os.path.join(dir_base,f))]
+    # purge older files in ascending order
+    files_list = [os.path.join(dir_base,f) for f in os.listdir(dir_base) if os.path.isfile(os.path.join(dir_base,f))]
     deleted_count = 0
     if len(files_list) > destination_size:
-        files_list.sort()
+        files_list.sort(key=os.path.getatime)
         dest_todel = len(files_list) - destination_size
         for x in range(0, dest_todel):
-            dest_dirtodel = os.path.join(dir_base, files_list[x])
+            dest_dirtodel = files_list[x]
             try:
                 os.remove(dest_dirtodel)
             except OSError:
