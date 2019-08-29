@@ -209,7 +209,7 @@ def purge_files(dir_base, destination_size):
     files_list = [os.path.join(dir_base,f) for f in os.listdir(dir_base) if os.path.isfile(os.path.join(dir_base,f))]
     deleted_count = 0
     if len(files_list) > destination_size:
-        files_list.sort(key=os.path.getatime)
+        files_list.sort(key=os.path.getmtime)
         dest_todel = len(files_list) - destination_size
         for x in range(0, dest_todel):
             dest_dirtodel = files_list[x]
