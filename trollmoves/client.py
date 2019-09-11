@@ -1,23 +1,23 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
+#
 # Copyright (c) 2012, 2013, 2014, 2015, 2016
-
+#
 # Author(s):
-
+#
 #   Martin Raspaud <martin.raspaud@smhi.se>
 #   Panu Lahtinen <panu.lahtinen@fmi.fi>
-
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-
+#
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
@@ -27,23 +27,25 @@ import socket
 import sys
 import time
 from collections import deque
-from ConfigParser import ConfigParser
+from six.moves.configparser import RawConfigParser
 from threading import Lock, Thread, Event
-from urlparse import urlparse, urlunparse
+import six
+from six.moves.urllib.parse import urlparse, urlunparse
 
-import netifaces
 import pyinotify
 from zmq import LINGER, POLLIN, REQ, Poller
 
-from posttroll import context
+from posttroll import get_context
 from posttroll.message import Message, MessageError
 from posttroll.publisher import NoisyPublisher
 from posttroll.subscriber import Subscriber
 
-from trollmoves import heartbeat_monitor
+from trollsift import globify, parse, Parser
 
-import utils
-from trollmoves.utils import unpack
+from trollmoves import heartbeat_monitor
+from trollmoves.utils import get_local_ips
+from trollmoves.utils import gen_dict_extract, translate_dict, translate_dict_value, is_file_ref_generator, create_aligned_datetime_var
+from trollmoves.utils import xrit, is_epilogue, purge_dir, purge_files, generate_ref, trigger_ref, bzip
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,7 +55,7 @@ cache_lock = Lock()
 
 DEFAULT_REQ_TIMEOUT = 1
 
-HEARTBEAT_TOPIC = "/heartbeat/move_it_server"
+SERVER_HEARTBEAT_TOPIC = "/heartbeat/move_it_server"
 
 
 def get_local_ips():
@@ -71,7 +73,7 @@ def get_local_ips():
 def read_config(filename):
     """Read the config file called *filename*.
     """
-    cp_ = ConfigParser()
+    cp_ = RawConfigParser()
     cp_.read(filename)
 
     res = {}
@@ -86,13 +88,15 @@ def read_config(filename):
         res[section].setdefault("heartbeat", True)
         res[section].setdefault("req_timeout", DEFAULT_REQ_TIMEOUT)
         res[section].setdefault("transfer_req_timeout", 10 * DEFAULT_REQ_TIMEOUT)
+        res[section].setdefault("nameservers", None)
         if res[section]["heartbeat"] in ["", "False", "false", "0", "off"]:
             res[section]["heartbeat"] = False
 
         if "providers" not in res[section]:
-            LOGGER.warning("Incomplete section " + section +
-                           ": add an 'providers' item.")
-            LOGGER.info("Ignoring section " + section + ": incomplete.")
+            LOGGER.warning("Incomplete section %s: add an 'providers' item.",
+                           section)
+            LOGGER.info("Ignoring section %s: incomplete.",
+                        section)
             del res[section]
             continue
         else:
@@ -101,9 +105,9 @@ def read_config(filename):
             ]
 
         if "destination" not in res[section]:
-            LOGGER.warning("Incomplete section " + section +
-                           ": add an 'destination' item.")
-            LOGGER.info("Ignoring section " + section + ": incomplete.")
+            LOGGER.warning("Incomplete section %s: add an 'destination' item.",
+                           section)
+            LOGGER.info("Ignoring section %s: incomplete.", section)
             del res[section]
             continue
 
@@ -116,9 +120,9 @@ def read_config(filename):
         elif not res[section]["heartbeat"]:
             # We have no topics and therefor no subscriber (if you want to
             # subscribe everything, then explicit specify an empty topic).
-            LOGGER.warning("Incomplete section " + section +
-                           ": add an 'topic' item or enable heartbeat.")
-            LOGGER.info("Ignoring section " + section + ": incomplete.")
+            LOGGER.warning("Incomplete section %s: add an 'topic' "
+                           "item or enable heartbeat.", section)
+            LOGGER.info("Ignoring section %s: incomplete.", section)
             del res[section]
             continue
 
@@ -206,134 +210,354 @@ class Listener(Thread):
             self.subscriber = None
 
 
-def request_push(msg, destination, login, publisher=None, **kwargs):
-    if kwargs["use_processed_log"]:
+def unpack_tar(filename, delete=False, unpack_prog=None):
+    """Unpack tar files."""
+    destdir = os.path.dirname(filename)
+    try:
+        with tarfile.open(filename) as tar:
+            tar.extractall(destdir)
+            members = tar.getmembers()
+    except tarfile.ReadError as err:
+        raise IOError(str(err))
+    if delete:
+        os.remove(filename)
+    return (member.name for member in members)
+
+def unpack_xrit(filename, delete=False, unpack_prog="./xRITDecompress"):
+    """Unpack xrit files"""
+    destination = os.path.dirname(filename)
+    try:
+        expected = xrit(filename, destination, cmd=unpack_prog)
+    except:
+        LOGGER.exception("Couldn't unpack_xrit file %s", sys.exc_info()[0])
+        return []
+    if delete:
+        os.remove(filename)
+    return expected
+
+def unpack_bz2(filename, delete=False, unpack_prog=None):
+    """Unpack bz2 files"""
+    destination = os.path.dirname(filename)
+    try:
+        expected = bzip(filename, destination)
+    except:
+        LOGGER.exception("Couldn't unpack_bz2 file %s", sys.exc_info()[0])
+        return []
+    if delete:
+        os.remove(filename)
+    return expected
+
+unpackers = {'tar': unpack_tar, 'xrit': unpack_xrit, 'bz2': unpack_bz2}
+
+
+def already_received(msg, processedlog=None):
+    """Check if the files from msg already are in the local cache."""
+    with cache_lock:
+        for filename in gen_dict_extract(msg.data, 'uid'):
+            if processedlog is not None:
+                # check filename in processed file log saved in filesystem
+                if str(filename) in processedlog.log_list:
+                    LOGGER.debug('File already Processed - file found in processed log: %s', str(msg.data["uid"]))
+                    return True
+            # check filename in file_cache
+            if filename in file_cache:
+                return True
+        return False
+
+
+def resend_if_local(msg, publisher):
+    """Resend the message provided all uris point to local files."""
+    for uri in gen_dict_extract(msg.data, 'uri'):
+        urlobj = urlparse(uri)
+        if not publisher or not socket.gethostbyname(urlobj.netloc) in get_local_ips():
+            return
+    else:
+        LOGGER.debug('Sending: %s', str(msg))
+        publisher.send(str(msg))
+
+
+def create_push_req_message(msg, destination, login):
+    fake_req = Message(msg.subject, 'push', data=msg.data.copy())
+    duri = urlparse(destination)
+    scheme = duri.scheme or 'file'
+    dest_hostname = duri.hostname or socket.gethostname()
+    fake_req.data["destination"] = urlunparse((scheme, dest_hostname, duri.path, "", "", ""))
+    if login:
+        # if necessary add the credentials for the real request
+        req = Message(msg.subject, 'push', data=msg.data.copy())
+        req.data["destination"] = urlunparse((scheme, login + "@" + dest_hostname, duri.path, "", "", ""))
+    else:
+        req = fake_req
+    return req, fake_req
+
+
+def create_destination_dir(msg, destination, destination_subdir=None):
+    """Compute destination dir adding the destination subdirectory and applying additional function"""
+    if destination_subdir is not None:
+        # FIXME: Apply real align() function as for trollstalker custom variables
+        # If %M|align(10) in destination_subdir: round minutes to the previous 10 minutes
+        if destination_subdir.find("%M|align(10)") > -1:
+            destination_subdir = destination_subdir.replace("%M|align(10)", "%M")
+            destination_time = msg.data['nominal_time'].strftime(destination_subdir)
+            destination_time = destination_time[:len(destination_time)-1] + "0"
+            new_dest = os.path.join(destination, destination_time)
+        else:
+            new_dest = os.path.join(destination, msg.data['nominal_time'].strftime(destination_subdir))
+    return new_dest
+
+
+def create_local_dir(destination, local_root, mode=0o777):
+    """Create the local directory if it doesn't exist and return that path."""
+    duri = urlparse(destination)
+    local_dir = os.path.join(*([local_root] + duri.path.split(os.path.sep)))
+
+    if not os.path.exists(local_dir):
+        os.makedirs(local_dir)
+        os.chmod(local_dir, mode)
+    return local_dir
+
+
+def unpack_and_create_local_message(msg, local_dir, unpack=None, delete=False, unpack_prog=None):
+
+    def unpack_callback(var):
+        if not var['uid'].endswith(unpack) and unpack != "xrit":
+            return var
+        packname = var.pop('uid')
+
+        del var['uri']
+        new_names = unpackers[unpack](os.path.join(local_dir, packname), delete, unpack_prog)
+
+
+        if unpack == "xrit":
+            var['file'] = new_names
+        else:
+            var['dataset'] = [dict(uid=nn, uri=os.path.join(local_dir, nn)) for nn in new_names]
+        return var
+
+    if unpack is not None:
+        lmsg_data = translate_dict(msg.data, ('uri', 'uid'), unpack_callback)
+        if 'dataset' in lmsg_data:
+            lmsg_type = 'dataset'
+        elif 'collection' in lmsg_data:
+            lmsg_type = 'collection'
+        else:
+            lmsg_type = 'file'
+    else:
+        lmsg_data = msg.data.copy()
+        lmsg_type = msg.type
+    return Message(msg.subject, lmsg_type, data=lmsg_data)
+
+def generate_ref_file(msg, destination, use_ref_file, ref_segment_pattern=None, var_pattern=None, ref_filter=None, ref_size=None, **kwargs):
+    """ Generate reference file
+    
+        Args:
+            msg (trollmove message)
+            destination (string): destination path of the file in processing
+            use_ref_file (string): pattern filename of reference file, including directory path
+            ref_segment_pattern (string): segments filename format that trigger ref file generation
+    """
+    result = compose_ref_filename(use_ref_file, msg.data['uid'], ref_segment_pattern, var_pattern, ref_filter)
+    if result is not None and result['ref_filename'] is not None:
+        ref_filename = result['ref_filename']
+        if os.path.isfile(ref_filename):
+            LOGGER.debug("Triggering reference file: " + ref_filename)
+            trigger_ref(destination, ref_filename)
+        else:
+            filter = result['filter']
+            if filter is None:
+                filter = "*"
+            LOGGER.debug("Generating reference file: " + ref_filename)
+            generate_ref(destination, msg.data['uid'], ref_filename, filter, ref_size)
+
+
+def trigger_ref_file(msg, destination, use_ref_file, ref_segment_pattern=None, var_pattern=None, **kwargs):
+    result = compose_ref_filename(use_ref_file, msg.data['uid'], ref_segment_pattern, var_pattern)
+    if result is not None:
+        ref_filename = result['ref_filename']
+        if ref_filename:
+            trigger_ref(destination, ref_filename)
+
+
+def compose_ref_filename(ref_pattern, segment, segment_pattern, var_pattern, ref_filter=None):
+    """ Compute filename of Reference file
+
+        Args:
+            ref_pattern (string): pattern for ref filename
+            segment (string): segment name that triggered ref file generation
+            segment_pattern (string): pattern of the segment that triggers ref file generation
+                                      used to retrieve information for the ref pattern filename
+            var_pattern (string): pattern rules to apply special function to segment_pattern variables
+
+        Returns:
+            (dict) ref_filename : filename of the ref file
+                   filter: filter for referenced files
+            None: if ref_filename cannot be computed
+    """
+    result = None
+    if segment_pattern is None:
+        # default segment pattern
+        segment_pattern = "H-000-{series:_<6s}-{platform_name:4s}________-{channel:_<9s}-{segment:_<9s}-{nominal_time:%Y%m%d%H%M}-{compress_flag:_<1s}_"
+    try:
+        ref_parser = Parser(ref_pattern)
+        segment_info = parse(segment_pattern, segment)
+        if "segment" in segment_info:
+            segment_info['segment'] = 'EPI'
+
+        # try to detect time align functionts and elaborate them
+        # if defined in var_pattern configuration
+        aligned = create_aligned_datetime_var(var_pattern,segment_info)
+        if aligned is not None:
+            segment_info.update(aligned)
+        ref_filename = ref_parser.compose(segment_info)
+
+        # Compute referenced files filter
+        result = dict()
+        result['filter'] = None
+        result['ref_filename'] = ref_filename
+        if ref_filter is not None:
+            if "{" in ref_filter:
+                start_pos = ref_filter.find("{")
+                if start_pos >= 0:
+                    end_pos = ref_filter.find("}", start_pos)
+                if end_pos >= 0:
+                    filter_var = ref_filter[start_pos+1:end_pos]
+                    if filter_var in segment_info:
+                        replace_var = segment_info[filter_var]
+                        if end_pos+1 >= len(ref_filter):
+                            result['filter'] = ref_filter[0:start_pos] + replace_var
+                        else:
+                            result['filter'] = ref_filter[0:start_pos] + replace_var + ref_filter[end:]
+            if ref_filter == "use_ref_file":
+                result['filter'] = segment
+            if result['filter'] is None:
+                # something didn't work with the replacement
+                result['filter'] = ref_filter
+
+    except ValueError:
+        LOGGER.info("File doesn't match ref file pattern")
+
+    return result
+
+
+def make_uris(msg, destination, login=None):
+    duri = urlparse(destination)
+    scheme = duri.scheme or 'ssh'
+    dest_hostname = duri.hostname or socket.gethostname()
+    if socket.gethostbyname(dest_hostname) in get_local_ips():
+        scheme_, host_ = "ssh", dest_hostname  # local file
+    else:
+        scheme_, host_ = scheme, dest_hostname  # remote file
+        if login:
+            # Add (only) user to uri.
+            host_ = login.split(":")[0] + "@" + host_
+
+    def uri_callback(var):
+        uid = var['uid']
+        path = os.path.join(duri.path, uid)
+        var['uri'] = urlunparse((scheme_, host_, path, "", "", ""))
+        return var
+    msg.data = translate_dict(msg.data, ('uri', 'uid'), uri_callback)
+    return msg
+
+
+def replace_mda(msg, kwargs):
+    for key in msg.data:
+        if key in kwargs:
+            replacement = dict(item.split(':')
+                               for item in kwargs[key].split('|'))
+            msg.data[key] = replacement[msg.data[key]]
+    return msg
+
+
+def request_push(msg, destination, login, publisher=None, unpack=None, delete=False, unpack_prog=None, **kwargs):
+    # Check if processed file log stored in filesystem is configured
+    if "circular_log" in kwargs:
         circular_log = kwargs["circular_log"]
     else:
-        circular_log = []
-    with cache_lock:
-        # Verify if the message has been already processed
-        if msg.data["uid"] in circular_log.log_list:
-            urlobj = urlparse(msg.data['uri'])
-            if publisher and socket.gethostbyname(
-                    urlobj.netloc) in get_local_ips():
-                LOGGER.debug('Sending: %s', str(msg))
-                publisher.send(str(msg))
-            LOGGER.debug('File already Processed - found in processed log: %s', str(msg.data["uid"]))
-            mtype = 'ack'
-        # file cache
-        # fixme: remove this
-        elif msg.data["uid"] in file_cache:
-            urlobj = urlparse(msg.data['uri'])
-            if publisher and socket.gethostbyname(
-                    urlobj.netloc) in get_local_ips():
-                LOGGER.debug('Sending: %s', str(msg))
-                publisher.send(str(msg))
-            mtype = 'ack'
+        circular_log = None
+
+    if already_received(msg, processedlog=circular_log):
+        resend_if_local(msg, publisher)
+        mtype = 'ack'
+        req = Message(msg.subject, mtype, data=msg.data)
+        LOGGER.debug("Sending: %s", str(req))
+        timeout = float(kwargs["req_timeout"])
+    else:
+        mtype = 'push'
+        if 'destination_subdir' in kwargs:
+            # If destination_subdir is defined, update destination
+            destination_base = destination
+            destination = create_destination_dir(msg, destination, kwargs["destination_subdir"])
+        req, fake_req = create_push_req_message(msg, destination, login)
+        LOGGER.info("Requesting: %s", str(fake_req))
+        timeout = float(kwargs["transfer_req_timeout"])
+        local_dir = create_local_dir(destination, kwargs.get('ftp_root', '/'))
+
+    LOGGER.debug("Send and recv timeout is %.2f seconds", timeout)
+
+    hostname, port = msg.data["request_address"].split(":")
+    requester = PushRequester(hostname, int(port))
+    response = requester.send_and_recv(req, timeout=timeout)
+
+    if response and response.type in ['file', 'collection', 'dataset']:
+        LOGGER.debug("Server done sending file")
+        with cache_lock:
+            for uid in gen_dict_extract(msg.data, 'uid'):
+                file_cache.append(uid)
+
+                # Add the segment to the processed log stored in filesystem
+                if circular_log is not None:
+                    circular_log.insert_element(uid)
+        try:
+            lmsg = unpack_and_create_local_message(response, local_dir, unpack, delete, unpack_prog)
+        except IOError:
+            LOGGER.exception("Couldn't unpack %s", str(response))
+            return
+
+        # If destination subdir is defined, purge the older subdirs
+        if 'destination_subdir' in kwargs:
+            destination_size = kwargs['destination_size'] if 'destination_size' in kwargs else 20
+            if destination_size <= 0:
+                destination_size = 20
+            purge_dir(destination_base, int(destination_size))
+        elif "destination_size" in kwargs:
+            # If destination_size is defined but there are no destination subdir, purge the destination files
+            purge_files(destination, int(kwargs['destination_size']))
+
+        if "generate_ref" in kwargs and is_file_ref_generator(msg.data["uid"], kwargs["generate_ref"]):
+            # The uid file should trigger generation of ref file
+            if "use_ref_file" in kwargs:
+                #If ref mode is defined generate the REF file
+                ref_segment_pattern = kwargs["ref_segment_pattern"] if "ref_segment_pattern" in kwargs else None
+                generate_ref_file(msg, destination, **kwargs)
         else:
-            mtype = 'push'
-        hostname, port = msg.data["request_address"].split(":")
-        req = Message(msg.subject, mtype, data=msg.data.copy())
+            if "use_ref_file" in kwargs:
+                #If ref mode is definied and file is not epilogue: retrigger the ref file
+                ref_segment_pattern = kwargs["ref_segment_pattern"] if "ref_segment_pattern" in kwargs else None
+                trigger_ref_file(msg, destination, **kwargs)
 
-        # Set download directory
-        destinationBase = destination
-        if kwargs["destination_subdir"] is not None:
-           # Compute destination directory based on nominal time informations
-           destination = os.path.join(destination, msg.data['nominal_time'].strftime(kwargs["destination_subdir"]))
+        if publisher:
+            lmsg = make_uris(lmsg, destination, login)
+            lmsg.data['origin'] = response.data['request_address']
+            lmsg.data.pop('request_address', None)
+            lmsg = replace_mda(lmsg, kwargs)
+            lmsg.data.pop('destination', None)
 
-        download_uri = urlparse(destination)
+            LOGGER.debug("publishing %s", str(lmsg))
+            publisher.send(str(lmsg))
 
-        scheme = download_uri.scheme or 'file'
-        dest_hostname = download_uri.hostname or socket.gethostname()
-
-        if mtype == 'push':
-            # A request without credentials is build first to be printed in the
-            # logs
-            req.data["destination"] = urlunparse((
-                scheme, dest_hostname, os.path.join(download_uri.path, msg.data[
-                    'uid']), "", "", ""))
-            LOGGER.info("Requesting: " + str(req))
-            if login:
-                # if necessary add the credentials for the real request
-                req.data["destination"] = urlunparse((
-                    scheme, login + "@" + dest_hostname, os.path.join(
-                        download_uri.path, msg.data['uid']), "", "", ""))
-            local_path = os.path.join(*([kwargs.get('ftp_root', '/')] +
-                                        download_uri.path.split(os.path.sep) +
-                                        [msg.data['uid']]))
-            local_dir = os.path.dirname(local_path)
-            if not os.path.exists(local_dir):
-                os.makedirs(local_dir)
-                os.chmod(local_dir, 0o777)
-            timeout = float(kwargs["transfer_req_timeout"])
-        else:
-            LOGGER.debug("Sending: %s" % str(req))
-            timeout = float(kwargs["req_timeout"])
-
-        LOGGER.debug("Send and recv timeout is %.2f seconds", timeout)
-
-        requester = PushRequester(hostname, int(port))
-        response = requester.send_and_recv(req, timeout=timeout)
-        if response and response.type == "file":
-            LOGGER.debug("Server done sending file")
-            file_cache.append(msg.data["uid"])
-            # Add the segment to the circular log
-            if kwargs['use_processed_log']:
-                circular_log.insert_element(msg.data["uid"])
-
-
-            # Decompress the file if necessary
-            if kwargs["compression"] is not  None:
-                # Compute filename to be decompressed
-                compressed_file = os.path.join(destination, msg.data['uid'])
-                # Decompressed on the same destination directory (not using working tmp directory)
-                kwargs["working_directory"] = destination
-                decompressed_file = unpack(compressed_file, **kwargs)
-
-            # Purge directory presents and generate Ref
-            if kwargs["destination_size"] is not None and kwargs["destination_subdir"] is not None:
-                if msg.data['uid'].find("-EPI") > 0:
-                    utils.purgeDir(destinationBase, int(kwargs["destination_size"]))
-                    utils.generateRef(destination, msg.data['uid'], destination + "/../../ref")
-                else:
-                    utils.touchRef(destination, msg.data['uid'], destination + "/../../ref")
-
-
-            if publisher:
-                if socket.gethostbyname(dest_hostname) in get_local_ips():
-                    scheme_, host_ = "file", ''  # local file
-                else:
-                    scheme_, host_ = scheme, dest_hostname  # remote file
-                    if login:
-                        # Add (only) user to uri.
-                        host_ = login.split(":")[0] + "@" + host_
-                local_msg = Message(msg.subject, "file", data=msg.data.copy())
-                local_uri = urlunparse((scheme_, host_,
-                                        local_path,
-                                        "", "", ""))
-                local_msg.data['uri'] = local_uri
-                local_msg.data['origin'] = local_msg.data['request_address']
-                local_msg.data.pop('request_address')
-
-                for key in local_msg.data:
-                    if key in kwargs:
-                        replacement = dict(item.split(':')
-                                           for item in kwargs[key].split('|'))
-                        local_msg.data[key] = replacement[local_msg.data[key]]
-                LOGGER.debug("publishing %s", str(local_msg))
-                publisher.send(str(local_msg))
-        elif response and response.type == "ack":
-            pass
-        else:
-            LOGGER.error("Failed to get valid response from server %s: %s",
-                         str(hostname), str(response))
+    elif response and response.type == "ack":
+        pass
+    else:
+        LOGGER.error("Failed to get valid response from server %s: %s",
+                     str(hostname), str(response))
 
 
 def reload_config(filename, chains, callback=request_push, pub_instance=None):
     """Rebuild chains if needed (if the configuration changed) from *filename*.
     """
 
-    LOGGER.debug("New config file detected! " + filename)
+    LOGGER.debug("New config file detected: %s", filename)
 
     new_chains = read_config(filename)
 
@@ -361,39 +585,32 @@ def reload_config(filename, chains, callback=request_push, pub_instance=None):
 
         chains[key] = val
         try:
-            chains[key]["publisher"] = NoisyPublisher("move_it_" + key,
-                                                      val["publish_port"])
+            nameservers = val["nameservers"]
+            if nameservers:
+                nameservers = nameservers.split()
+            chains[key]["publisher"] = NoisyPublisher(
+                "move_it_" + key,
+                port=val["publish_port"],
+                nameservers=nameservers)
         except (KeyError, NameError):
             pass
 
         chains[key].setdefault("listeners", {})
 
-        # Load circular log file configurations
-        # Use circualr log if procfile_log is defined or use_processed_log is true
-        if "procfile_log" not in chains[key]:
-            if "use_processed_log" in chains[key]:
-                if chains[key]["use_processed_log"] == "True":
-                    chains[key]["use_processed_log"] = True
-                    chains[key]["procfile_log"] = circular_log_filename
-                else:
-                    chains[key]["use_processed_log"] = False
-            else:
-                chains[key]["use_processed_log"] = False
-        else:
-            chains[key]["use_processed_log"] = True
-        if "procfile_log_size" not in chains[key]:
-            chains[key]["procfile_log_size"] = circular_log_size
-
-        if chains[key]["use_processed_log"]:
-            circular_log = CircularLog(chains[key]["procfile_log"], chains[key]["procfile_log_size"])
-            chains[key]["circular_log"] = circular_log
+        # Use processed file log if procfile_log is defined
+        if "procfile_log" in chains[key]:
+            circular_log_filename = chains[key]["procfile_log"]
+            circular_log_size = 11000
+            if "procfile_log_size" in chains[key]:
+                circular_log_size = chains[key]["procfile_log_size"]
+            chains[key]["circular_log"] = CircularLog(circular_log_filename, int(circular_log_size))
 
         try:
             topics = []
             if "topic" in val:
                 topics.append(val["topic"])
             if val.get("heartbeat", False):
-                topics.append(HEARTBEAT_TOPIC)
+                topics.append(SERVER_HEARTBEAT_TOPIC)
             for provider in chains[key]["providers"]:
                 chains[key]["listeners"][provider] = Listener(
                     provider,
@@ -411,9 +628,9 @@ def reload_config(filename, chains, callback=request_push, pub_instance=None):
             chains[key]["publisher"].start()
 
         if not identical:
-            LOGGER.debug("Updated " + key)
+            LOGGER.debug("Updated %s", key)
         else:
-            LOGGER.debug("Added " + key)
+            LOGGER.debug("Added %s", key)
 
     # disable old chains
 
@@ -426,9 +643,9 @@ def reload_config(filename, chains, callback=request_push, pub_instance=None):
             chains[key]["publisher"].stop()
 
         del chains[key]
-        LOGGER.debug("Removed " + key)
+        LOGGER.debug("Removed %s", key)
 
-    LOGGER.debug("Reloaded config from " + filename)
+    LOGGER.debug("Reloaded config from %s", filename)
 
 
 class PushRequester(object):
@@ -451,7 +668,7 @@ class PushRequester(object):
     def connect(self):
         """Connect to the server
         """
-        self._socket = context.socket(REQ)
+        self._socket = get_context().socket(REQ)
         self._socket.connect(self._reqaddress)
         self._poller.register(self._socket, POLLIN)
 
@@ -503,21 +720,21 @@ class PushRequester(object):
                     # During big file transfers, give some time to a friend.
                     time.sleep(0.1)
 
-                LOGGER.warning("Timeout from " + str(self._reqaddress) +
-                               ", retrying...")
+                LOGGER.warning("Timeout from %s, retrying...",
+                               str(self._reqaddress))
                 # Socket is confused. Close and remove it.
                 self.stop()
                 retries_left -= 1
                 if retries_left <= 0:
-                    LOGGER.error("Server doesn't answer, abandoning... " + str(
-                        self._reqaddress))
+                    LOGGER.error("Server %s doesn't answer, abandoning.",
+                                 str(self._reqaddress))
                     self.connect()
                     self.failures += 1
                     if self.failures == 5:
-                        LOGGER.critical("Server jammed ? %s", self._reqaddress)
+                        LOGGER.critical("Server jammed: %s", self._reqaddress)
                         self.jammed = True
                     break
-                LOGGER.info("Reconnecting and resending " + str(msg))
+                LOGGER.info("Reconnecting and resending %s", str(msg))
                 # Create new connection
                 self.connect()
                 self._socket.send(request)
@@ -566,7 +783,7 @@ class StatCollector(object):
 
 
 def terminate(chains):
-    for chain in chains.itervalues():
+    for chain in six.itervalues(chains):
         for listener in chain["listeners"].values():
             listener.stop()
         if "publisher" in chain:
@@ -578,21 +795,20 @@ def terminate(chains):
     sys.exit(0)
 
 
-"""
-    Functions for file_cache_log:
-        - Circular log of file already processed by the client
-        - Write and load the log into the system
-"""
-
 class CircularLog(object):
+    """Save and manage segments already processed by move client in a log in filesystem.
+       Using CricularLog, when moves client and server is restarted: old segments are not processed again
+    """
+
     filename = ""
     log_list = [] # pos 0 reserved for current position, pos 1 reserved for max size
     header_len = 2
 
     def __init__(self, filename, max_size):
         """
-        :param filename: string
-        :param max_size: int
+        :Args:
+            filename (string): Log filename
+            max_size (int): Maximum size of files stored in the log file
         """
         self.filename = filename
         self.max_size = max_size
@@ -603,13 +819,13 @@ class CircularLog(object):
 
     def circular_log_init(self, log_filename, max_size):
         """ Initialize circular log file cache
-
-            :param log_filename: filename corresponding with the circular log file
         """
         tmp_list = []
         tmp_pos = self.header_len-1
-        tmp_list.append(str(tmp_pos)) # write the header: it contains the current write position and max size
-        tmp_list.append(str(max_size)) # write the header: it contains the current write position and max size
+
+        # write the header: it contains the current write position and max size
+        tmp_list.append(str(tmp_pos))
+        tmp_list.append(str(max_size))
         open(log_filename, 'wr').write('\n'.join(tmp_list)) # write the file
 
     def circular_log_load(self, max_size):
@@ -621,7 +837,7 @@ class CircularLog(object):
             #there is a problem with the file, re-initialize it
             self.circular_log_init(self.filename, max_size)
             cache_log = open(self.filename).read().split('\n')
-        if int(cache_log[1]) != max_size:
+        if int(cache_log[1]) != int(max_size):
             return self.circular_log_update_size(cache_log, max_size) # update max size
         return cache_log
 
@@ -654,23 +870,18 @@ class CircularLog(object):
 
     def insert_element(self, uid):
         """ Insert a new element in cache_log
-        :param uid: string. Unique id of the processed segments
 
-            Insert the new element in the cache_log list in the correct position
-            Write the updated log text file
+            Args:
+                uid (string): Unique id of the processed segments to insert in the log
         """
         tmp_pos = int(self.log_list[0])
         maxlen = int(self.log_list[1])
         next_pos = tmp_pos + 1
         if next_pos >= maxlen+self.header_len:
-            self.log_list.insert(self.header_len, str(uid))
-            self.log_list[0] = str(self.header_len)
+            next_pos = self.header_len
+        if next_pos <= (len(self.log_list)-1):
+            self.log_list[next_pos] = str(uid)
         else:
             self.log_list.insert(next_pos, str(uid))
-            self.log_list[0] = str(next_pos)
-        if len(self.log_list)>(maxlen+self.header_len):
-            # Remove the last elem if max length already reached
-            del self.log_list[(maxlen+self.header_len):]
+        self.log_list[0] = str(next_pos)
         open(self.filename, 'wr').write('\n'.join(self.log_list))
-
-

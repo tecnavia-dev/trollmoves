@@ -1,23 +1,23 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
+#
 # Copyright (c) 2012, 2013, 2014, 2015
-
+#
 # Author(s):
-
+#
 #   Martin Raspaud <martin.raspaud@smhi.se>
 #   Panu Lahtinen <panu.lahtinen@fmi.fi>
-
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-
+#
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
@@ -141,15 +141,18 @@ import shutil
 import subprocess
 import sys
 import time
-from ConfigParser import ConfigParser
+from six.moves.configparser import RawConfigParser
 from ftplib import FTP, all_errors
-from urlparse import urlparse, urlunparse
+from six.moves.urllib.parse import urlparse, urlunparse
+import argparse
+import signal
 
 import pyinotify
 
 from trollsift import globify, parse
 
 LOGGER = logging.getLogger("move_it")
+LOG_FORMAT = "[%(asctime)s %(levelname)-8s] %(message)s"
 
 # messaging is optional
 try:
@@ -168,7 +171,7 @@ chains = {}
 def read_config(filename):
     """Read the config file called *filename*.
     """
-    cp_ = ConfigParser()
+    cp_ = RawConfigParser()
     cp_.read(filename)
 
     res = {}
@@ -182,17 +185,15 @@ def read_config(filename):
         res[section].setdefault("compression", False)
 
         if "origin" not in res[section]:
-            LOGGER.warning("Incomplete section " + section
-                           + ": add an 'origin' item.")
-            LOGGER.info("Ignoring section " + section
-                        + ": incomplete.")
+            LOGGER.warning("Incomplete section %s: add an 'origin' item.",
+                           section)
+            LOGGER.info("Ignoring section %s: incomplete.", section)
             del res[section]
             continue
         if "destinations" not in res[section]:
-            LOGGER.warning("Incomplete section " + section
-                           + ": add an 'destinations' item.")
-            LOGGER.info("Ignoring section " + section
-                        + ": incomplete.")
+            LOGGER.warning("Incomplete section %s: add an 'destinations' item.",
+                           section)
+            LOGGER.info("Ignoring section %s: incomplete.", section)
             del res[section]
             continue
         else:
@@ -210,10 +211,7 @@ def read_config(filename):
 def reload_config(filename):
     """Rebuild chains if needed (if the configuration changed) from *filename*.
     """
-    if os.path.abspath(filename) != os.path.abspath(cmd_args.config_file):
-        return
-
-    LOGGER.debug("New config file detected! " + filename)
+    LOGGER.debug("New config file detected! %s", filename)
 
     new_chains = read_config(filename)
 
@@ -281,7 +279,7 @@ def reload_config(filename):
                 info['uid'] = fname
                 msg = Message(val["topic"], 'file', info)
                 pub.send(str(msg))
-                LOGGER.debug("Message sent: " + str(msg))
+                LOGGER.debug("Message sent: %s", str(msg))
 
             chains[key]["copy_hook"] = copy_hook
 
@@ -295,21 +293,21 @@ def reload_config(filename):
                 info['uid'] = fname
                 msg = Message(val["topic"], 'del', info)
                 pub.send(str(msg))
-                LOGGER.debug("Message sent: " + str(msg))
+                LOGGER.debug("Message sent: %s", str(msg))
 
             chains[key]["delete_hook"] = delete_hook
 
         if not identical:
-            LOGGER.debug("Updated " + key)
+            LOGGER.debug("Updated %s", key)
         else:
-            LOGGER.debug("Added " + key)
+            LOGGER.debug("Added %s", key)
 
     for key in (set(chains.keys()) - set(new_chains.keys())):
         chains[key]["notifier"].stop()
         del chains[key]
-        LOGGER.debug("Removed " + key)
+        LOGGER.debug("Removed %s", key)
 
-    LOGGER.debug("Reloaded config from " + filename)
+    LOGGER.debug("Reloaded config from %s", filename)
     if old_glob:
         fnames = []
         for pattern in old_glob:
@@ -333,7 +331,7 @@ def check_output(*popenargs, **kwargs):
     """
     if 'stdout' in kwargs:
         raise ValueError('stdout argument not allowed, it will be overridden.')
-    LOGGER.debug("Calling " + str(popenargs))
+    LOGGER.debug("Calling %s", str(popenargs))
     process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
     output, unused_err = process.communicate()
     del unused_err
@@ -356,11 +354,10 @@ def xrit(pathname, destination=None, cmd="./xRITDecompress"):
         res = check_output([cmd, pathname], cwd=(destination or opath))
         del res
     else:
-        LOGGER.exception("Can not extract file " + pathname
-                         + " to " + destination
-                         + ", destination has to be local.")
-    LOGGER.info("Successfully extracted" + pathname +
-                " to " + destination)
+        LOGGER.exception("Can not extract file %s to %s, destination has to be local.",
+                         pathname, destination)
+    LOGGER.info("Successfully extracted %s to %s", pathname,
+                destination)
     return os.path.join((destination or opath), ofile[:-2] + "__")
 
 
@@ -383,7 +380,7 @@ def bzip(origin, destination=None):
                 if not block:
                     break
                 dest.write(block)
-            LOGGER.debug("Bunzipped " + origin + " to " + destfile)
+            LOGGER.debug("Bunzipped %s to %s", origin, destfile)
         finally:
             orig.close()
     return destfile
@@ -395,86 +392,30 @@ def move_it(pathname, destinations, hook=None, dest_subdir="", dest_size=0):
     """Check if the file pointed by *filename* is in the filelist, and move it
     if it is.
     """
-    e = None
+    err = None
     for dest in destinations:
-        # TA: Compute the destination using time stemp of the raw_input
-        #dest_subdir = "%Y%m%d%H%M/"
-        #dest_size = 5
-        dest_size = int(dest_size)
-
-        fname = os.path.basename(pathname)
-        dest_year  = fname[46:50]
-        dest_month = fname[50:52]
-        dest_day   = fname[52:54]
-        dest_hour  = fname[54:56]
-        dest_min   = fname[56:58]
-        import string
-        dest_subdir = string.replace(dest_subdir, "%Y", dest_year)
-        dest_subdir = string.replace(dest_subdir, "%m", dest_month)
-        dest_subdir = string.replace(dest_subdir, "%d", dest_day)
-        dest_subdir = string.replace(dest_subdir, "%H", dest_hour)
-        dest_subdir = string.replace(dest_subdir, "%M", dest_min)
-
-        # Purge directory presents
-        if fname.find("-EPI") > 0:
-            dest_list = os.listdir(dest)
-            dest_listsubdir = []
-            for dest_dir in dest_list:
-                if os.path.isdir(os.path.join(dest, dest_dir)):
-                    dest_listsubdir.append(dest_dir)
-            print "List subdir: "
-            print dest_listsubdir
-            if len(dest_listsubdir) > dest_size:
-                dest_listsubdir.sort()
-                print "Sorted: "
-                print dest_listsubdir
-                dest_todel = len(dest_listsubdir) - dest_size
-                for x in range(0, dest_todel):
-                   dest_dirtodel = os.path.join(dest, dest_listsubdir[x])
-                   print "Todel " + dest_dirtodel
-                   shutil.rmtree(dest_dirtodel)
-
-
-
-        if dest_subdir != "":
-            dest = os.path.join(dest, dest_subdir)
-
-
-        if not os.path.exists(dest):
-            os.makedirs(dest, 0777)
-        LOGGER.debug("Copying to: " + dest)
+        LOGGER.debug("Copying to: %s", dest)
         dest_url = urlparse(dest)
         try:
             mover = MOVERS[dest_url.scheme]
-        except KeyError, e:
-            LOGGER.error("Unsupported protocol '" + str(dest_url.scheme)
-                         + "'. Could not copy " + pathname + " to "
-                         + str(dest))
+        except KeyError as err:
+            LOGGER.error("Unsupported protocol '%s'. Could not copy %s to %s",
+                         str(dest_url.scheme), pathname, str(dest))
             continue
         try:
             mover(pathname, dest_url).copy()
             if hook:
                 hook(pathname, dest_url)
-
-            if fname.find("-EPI") > 0:
-                dest_epistr = "[REF]\r\n"
-                dest_epistr += "SourcePath = " + dest + "\r\n"
-                dest_epistr += "FileName = " + fname + "\r\n"
-                dest_epifile = dest + "/../../ref/" + fname
-                dest_epifilefp = open(dest_epifile, "w")
-                dest_epifilefp.write(dest_epistr)
-                dest_epifilefp.close()
-
-        except Exception, e:
-            LOGGER.exception("Something went wrong during copy of "
-                             + pathname + " to " + str(dest))
+        except Exception as err:
+            LOGGER.exception("Something went wrong during copy of %s to %s",
+                             pathname, str(dest))
             continue
         else:
-            LOGGER.info("Successfully copied " + pathname +
-                        " to " + str(dest))
+            LOGGER.info("Successfully copied %s to %s", pathname,
+                        str(dest))
 
-    if e is not None:
-        raise e
+    if err is not None:
+        raise err
 
 
 class Mover(object):
@@ -611,7 +552,7 @@ def create_notifier(attrs):
         """
         efile = os.path.basename(pathname)
         if fnmatch.fnmatch(efile, ofile):
-            LOGGER.info("We have a match: " + str(pathname))
+            LOGGER.info("We have a match: %s", str(pathname))
             if attrs["compression"]:
                 try:
                     unpack_fun = eval(attrs["compression"])
@@ -623,30 +564,27 @@ def create_notifier(attrs):
                         new_path = unpack_fun(pathname,
                                               attrs["working_directory"])
                 except:
-                    LOGGER.exception("Could not decompress " + pathname)
+                    LOGGER.exception("Could not decompress %s", pathname)
                     return
 
             else:
                 new_path = pathname
             try:
                 move_it(new_path, attrs["destinations"],
-                        attrs.get("copy_hook", None),
-                        attrs["destination_subdir"],
-                        attrs["destination_size"]
-                        )
-            except Exception, e:
-                LOGGER.error("Something went wrong during copy of "
-                             + pathname)
+                        attrs.get("copy_hook", None))
+            except Exception as err:
+                LOGGER.error("Something went wrong during copy of %s",
+                             pathname)
             else:
                 if attrs["delete"]:
                     try:
                         os.remove(pathname)
                         if attrs["delete_hook"]:
                             attrs["delete_hook"](pathname)
-                        LOGGER.debug("Removed " + pathname)
-                    except OSError, e__:
+                        LOGGER.debug("Removed %s", pathname)
+                    except OSError as e__:
                         if e__.errno == 2:
-                            LOGGER.debug("Already deleted: " + pathname)
+                            LOGGER.debug("Already deleted: %s", pathname)
                         else:
                             raise
 
@@ -667,46 +605,52 @@ def create_notifier(attrs):
     return tnotifier
 
 
-def terminate(chains):
-    for chain in chains.itervalues():
+def terminate(chainss):
+    for chain in chainss.itervalues():
         chain["notifier"].stop()
         if "publisher" in chain:
             chain["publisher"].stop()
     LOGGER.info("Shutting down.")
-    print ("Thank you for using pytroll/move_it."
-           " See you soon on pytroll.org!")
+    print("Thank you for using pytroll/move_it."
+          " See you soon on pytroll.org!")
     time.sleep(1)
     sys.exit(0)
 
-if __name__ == '__main__':
-    import argparse
-    import signal
 
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("config_file",
                         help="The configuration file to run on.")
     parser.add_argument("-l", "--log",
                         help="The file to log to. stdout otherwise.")
-    cmd_args = parser.parse_args()
+    return parser.parse_args()
 
-    log_format = "[%(asctime)s %(levelname)-8s] %(message)s"
+
+def setup_logging(cmd_args):
+    global LOGGER
     LOGGER = logging.getLogger('move_it')
     LOGGER.setLevel(logging.DEBUG)
 
     if cmd_args.log:
-        fh = logging.handlers.TimedRotatingFileHandler(
+        fh_ = logging.handlers.TimedRotatingFileHandler(
             os.path.join(cmd_args.log),
             "midnight",
             backupCount=7)
     else:
-        fh = logging.StreamHandler()
+        fh_ = logging.StreamHandler()
 
-    formatter = logging.Formatter(log_format)
-    fh.setFormatter(formatter)
+    formatter = logging.Formatter(LOG_FORMAT)
+    fh_.setFormatter(formatter)
 
-    LOGGER.addHandler(fh)
+    LOGGER.addHandler(fh_)
 
-    pyinotify.log.handlers = [fh]
+    pyinotify.log.handlers = [fh_]
+
+
+def main():
+
+    cmd_args = parse_args()
+    setup_logging(cmd_args)
 
     LOGGER.info("Starting up.")
 
@@ -719,6 +663,7 @@ if __name__ == '__main__':
     watchman.add_watch(os.path.dirname(cmd_args.config_file), mask)
 
     def chains_stop(*args):
+        del args
         terminate(chains)
 
     signal.signal(signal.SIGTERM, chains_stop)
@@ -730,3 +675,7 @@ if __name__ == '__main__':
         LOGGER.debug("Interrupting")
     finally:
         terminate(chains)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,23 +1,23 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
+#
 # Copyright (c) 2012, 2013, 2014, 2015, 2016
-
+#
 # Author(s):
-
+#
 #   Martin Raspaud <martin.raspaud@smhi.se>
 #   Panu Lahtinen <panu.lahtinen@fmi.fi>
-
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-
+#
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
@@ -33,22 +33,33 @@ import subprocess
 import sys
 import time
 import traceback
-from ConfigParser import ConfigParser
-from ftplib import FTP, all_errors
-from Queue import Empty, Queue
-from threading import Thread
-from urlparse import urlparse, urlunparse
+import socket
+import tempfile
+import sre_constants
+
+from six.moves.configparser import ConfigParser, RawConfigParser
+from ftplib import FTP, all_errors, error_perm
+
+from six.moves.queue import Empty, Queue
+from threading import Thread, Event, current_thread, Lock
+from six.moves.urllib.parse import urlparse, urlunparse
+from six import string_types
+from collections import deque
 
 import pyinotify
 from zmq import NOBLOCK, POLLIN, PULL, PUSH, ROUTER, Poller, ZMQError
 from threading import Thread
 
-from posttroll import context
+from posttroll import get_context
 from posttroll.message import Message
 from posttroll.publisher import get_own_ip
 from trollsift import globify, parse
 
-from trollmoves.utils import unpack
+from trollmoves.utils import get_local_ips
+from trollmoves.utils import gen_dict_extract, gen_dict_contains
+from trollmoves.utils import xrit, bzip
+from trollmoves.client import DEFAULT_REQ_TIMEOUT
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -82,7 +93,7 @@ class Deleter(Thread):
                         self.delete(filename)
                     except:
                         LOGGER.exception(
-                            'Something went wrong when deleting %s:', filename)
+                            'Something went wrong when deleting %s', filename)
                     else:
                         LOGGER.debug('Removed %s.', filename)
                     break
@@ -109,10 +120,10 @@ class RequestManager(Thread):
         Thread.__init__(self)
 
         self._loop = True
-        self.out_socket = context.socket(ROUTER)
+        self.out_socket = get_context().socket(ROUTER)
         self.out_socket.bind("tcp://*:" + str(port))
         self.port = port
-        self.in_socket = context.socket(PULL)
+        self.in_socket = get_context().socket(PULL)
         self.in_socket.bind("inproc://replies" + str(port))
 
         self._poller = Poller()
@@ -130,7 +141,7 @@ class RequestManager(Thread):
         except (KeyError, TypeError):
             LOGGER.warning("Station is not defined in config file")
             self._station = "unknown"
-        LOGGER.debug("Station is '%s'" % self._station)
+        LOGGER.debug("Station is '%s'", self._station)
 
     def start(self):
         self._deleter.start()
@@ -201,7 +212,7 @@ class RequestManager(Thread):
         return Message(message.subject, "unknown")
 
     def reply_and_send(self, fun, address, message):
-        in_socket = context.socket(PUSH)
+        in_socket = get_context().socket(PUSH)
         in_socket.connect("inproc://replies" + str(self.port))
 
         reply = Message(message.subject, "error")
@@ -211,8 +222,12 @@ class RequestManager(Thread):
             LOGGER.exception("Something went wrong"
                              " when processing the request: %s", str(message))
         finally:
-            LOGGER.debug("Response: " + str(message))
-            in_socket.send_multipart([address, b'', str(reply)])
+            LOGGER.debug("Response: %s", str(reply))
+            try:
+                in_socket.send_multipart([address, b'', str(reply)])
+            except TypeError:
+                in_socket.send_multipart([address, b'', bytes(str(reply),
+                                                              'utf-8')])
 
     def run(self):
         while self._loop:
@@ -223,7 +238,7 @@ class RequestManager(Thread):
                 continue
             if socks.get(self.out_socket) == POLLIN:
                 LOGGER.debug("Received a request")
-                address, empty, payload = self.out_socket.recv_multipart(
+                address, _, payload = self.out_socket.recv_multipart(
                     NOBLOCK)
                 message = Message(rawstr=payload)
                 fake_msg = Message(rawstr=str(message))
@@ -235,7 +250,7 @@ class RequestManager(Thread):
                     fake_msg.data['destination'] = clean_url(message.data[
                         'destination'])
 
-                LOGGER.debug("processing request: " + str(fake_msg))
+                LOGGER.debug("processing request: %s", str(fake_msg))
                 if message.type == "ping":
                     Thread(target=self.reply_and_send,
                            args=(self.pong, address, message)).start()
@@ -282,18 +297,87 @@ def pollingScanDir(scanPath, timeSleepNoWork, cb_function):
         else:
            timeSleep = timeSleepNoWork
 
-        listBefore = listAfter
+class Listener(Thread):
+
+    def __init__(self, attrs, publisher):
+        super(Listener, self).__init__()
+        self.attrs = attrs
+        self.publisher = publisher
+        self.loop = True
+
+    def run(self):
+        with Subscribe('', topics=self.attrs['listen'], addr_listener=True) as sub:
+            for msg in sub.recv(1):
+                if msg is None:
+                    if not self.loop:
+                        break
+                    else:
+                        continue
+
+                # check that files are local
+                for uri in gen_dict_extract(msg.data, 'uri'):
+                    urlobj = urlparse(uri)
+                    if(urlobj.scheme not in ['', 'file']
+                       and not socket.gethostbyname(urlobj.netloc) in get_local_ips()):
+                        break
+                else:
+                    LOGGER.debug('We have a match: %s', str(msg))
+
+                    #pathname = unpack(orig_pathname, **attrs)
+
+                    info = self.attrs.get("info", {})
+                    if info:
+                        info = dict((elt.strip().split('=') for elt in info.split(";")))
+                        for infokey, infoval in info.items():
+                            if "," in infoval:
+                                info[infokey] = infoval.split(",")
+
+                    # info.update(parse(attrs["origin"], orig_pathname))
+                    # info['uri'] = pathname
+                    # info['uid'] = os.path.basename(pathname)
+                    info.update(msg.data)
+                    info['request_address'] = self.attrs.get(
+                        "request_address", get_own_ip()) + ":" + self.attrs["request_port"]
+                    old_data = msg.data
+                    msg = Message(self.attrs["topic"], msg.type, info)
+                    self.publisher.send(str(msg))
+                    with file_cache_lock:
+                        for filename in gen_dict_extract(old_data, 'uid'):
+                            file_cache.appendleft(self.attrs["topic"] + '/' + filename)
+                    LOGGER.debug("Message sent: %s", str(msg))
+                    if not self.loop:
+                        break
+
+    def stop(self):
+        self.loop = False
+
+
+def create_posttroll_notifier(attrs, publisher):
+    """Create a notifier listening to posttroll messages from *attrs*.
+    """
+    listener = Listener(attrs, publisher)
+
+    return listener, None
+
 
 def create_notifier(attrs, publisher):
     """Create a notifier from the specified configuration attributes *attrs*.
     """
 
-    scanMode = "pynotify"
-    if attrs["origin_scanmode"] is not None:
-        scanMode = attrs["origin_scanmode"]
+    tmask = (pyinotify.IN_CLOSE_WRITE |
+             pyinotify.IN_MOVED_TO |
+             pyinotify.IN_CREATE)
+
+    wm_ = pyinotify.WatchManager()
 
     pattern = globify(attrs["origin"])
     opath = os.path.dirname(pattern)
+
+    # default scan mode is pynotify
+    scan_mode = "pynotify"
+    if attrs["origin_scanmode"] is not None:
+        # read configured scan mode
+        scan_mode = attrs["origin_scanmode"]
 
     def fun(orig_pathname):
         """Publish what we have."""
@@ -318,23 +402,22 @@ def create_notifier(attrs, publisher):
             "request_address", get_own_ip()) + ":" + attrs["request_port"]
         msg = Message(attrs["topic"], 'file', info)
         publisher.send(str(msg))
-        LOGGER.debug("Message sent: " + str(msg))
+        with file_cache_lock:
+            file_cache.appendleft(attrs["topic"] + '/' + info["uid"])
+        LOGGER.debug("Message sent: %s", str(msg))
 
+    if scan_mode == "polling":
+        # polling
+        thread = PollingManager(opath, fun)
 
-    if scanMode == "pynotify":
-        tmask = (pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO |
-                 pyinotify.IN_CREATE)
-        wm_ = pyinotify.WatchManager()
+        return thread, scan_mode, fun
+    else:
+        # pynotify
         tnotifier = pyinotify.ThreadedNotifier(wm_, EventHandler(fun))
         wm_.add_watch(opath, tmask)
 
-        return tnotifier, fun
-    else:
-        #thread = Thread(target = pollingScanDir, args = (opath, 20, fun))
-        thread = PollerManager(opath, fun)
+        return tnotifier, scan_mode, fun
 
-        #thread.start()
-        return thread, scanMode, fun
 
 
 def clean_url(url):
@@ -347,7 +430,7 @@ def clean_url(url):
 def read_config(filename):
     """Read the config file called *filename*.
     """
-    cp_ = ConfigParser()
+    cp_ = RawConfigParser()
     cp_.read(filename)
 
     res = {}
@@ -356,11 +439,13 @@ def read_config(filename):
         res[section] = dict(cp_.items(section))
         res[section].setdefault("working_directory", None)
         res[section].setdefault("compression", False)
-
-        if "origin" not in res[section]:
-            LOGGER.warning("Incomplete section " + section +
-                           ": add an 'origin' item.")
-            LOGGER.info("Ignoring section " + section + ": incomplete.")
+        res[section].setdefault("req_timeout", DEFAULT_REQ_TIMEOUT)
+        res[section].setdefault("transfer_req_timeout", 10 * DEFAULT_REQ_TIMEOUT)
+        res[section].setdefault("ssh_key_filename", None)
+        if ("origin" not in res[section]) and ('listen' not in res[section]):
+            LOGGER.warning("Incomplete section %s: add an 'origin' or "
+                           "'listen' item.", section)
+            LOGGER.info("Ignoring section %s: incomplete.", section)
             del res[section]
             continue
 
@@ -373,9 +458,10 @@ def read_config(filename):
         #    continue
 
         if "topic" not in res[section]:
-            LOGGER.warning("Incomplete section " + section +
-                           ": add an 'topic' item.")
-            LOGGER.info("Ignoring section " + section + ": incomplete.")
+            LOGGER.warning("Incomplete section %s: add an 'topic' item.",
+                           section)
+            LOGGER.info("Ignoring section %s: incomplete.",
+                        section)
             continue
         else:
             try:
@@ -394,7 +480,7 @@ def reload_config(filename,
     """Rebuild chains if needed (if the configuration changed) from *filename*.
     """
 
-    LOGGER.debug("New config file detected! " + filename)
+    LOGGER.debug("New config file detected: %s", filename)
 
     new_chains = read_config(filename)
 
@@ -415,7 +501,7 @@ def reload_config(filename,
             if chains[key]["notifier_scanmode"] == "polling":
                 chains[key]["notifier"].join()
             else:
-               chains[key]["notifier"].stop()
+                chains[key]["notifier"].stop()
 
             if "request_manager" in chains[key]:
                 chains[key]["request_manager"].stop()
@@ -434,23 +520,31 @@ def reload_config(filename,
             LOGGER.warning('Remove and skip %s', key)
             del chains[key]
             continue
-        chains[key]["notifier"], chains[key]["notifier_scanmode"],  fun = notifier_builder(val, publisher)
+
+        if notifier_builder is None:
+            if 'origin' in val:
+                notifier_builder = create_file_notifier
+            elif 'listen' in val:
+                notifier_builder = create_posttroll_notifier
+
+        chains[key]["notifier"], chains[key]["notifier_scanmode"], fun = notifier_builder(val, publisher)
+
         chains[key]["request_manager"].start()
         chains[key]["notifier"].start()
         old_glob.append((globify(val["origin"]), fun))
 
         if not identical:
-            LOGGER.debug("Updated " + key)
+            LOGGER.debug("Updated %s", key)
         else:
-            LOGGER.debug("Added " + key)
+            LOGGER.debug("Added %s", key)
 
     for key in (set(chains.keys()) - set(new_chains.keys())):
         chains[key]["notifier"].stop()
         del chains[key]
-        LOGGER.debug("Removed " + key)
+        LOGGER.debug("Removed %s", key)
 
-    LOGGER.debug("Reloaded config from " + filename)
-    if old_glob:
+    LOGGER.debug("Reloaded config from %s", filename)
+    if old_glob and not disable_backlog:
         time.sleep(3)
         for pattern, fun in old_glob:
             process_old_files(pattern, fun)
@@ -462,7 +556,49 @@ def reload_config(filename,
 # xrit
 
 
-def move_it(message, attrs=None, hook=None):
+def check_output(*popenargs, **kwargs):
+    """Copy from python 2.7, `subprocess.check_output`."""
+    if 'stdout' in kwargs:
+        raise ValueError('stdout argument not allowed, it will be overridden.')
+    LOGGER.debug("Calling %s", str(popenargs))
+    process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
+    output, unused_err = process.communicate()
+    del unused_err
+    retcode = process.poll()
+    if retcode:
+        cmd = kwargs.get("args")
+        if cmd is None:
+            cmd = popenargs[0]
+        raise RuntimeError(output)
+    return output
+
+def unpack(pathname,
+           compression=None,
+           working_directory=None,
+           prog=None,
+           delete="False",
+           **kwargs):
+    """Unpack *pathname*."""
+    del kwargs
+    if compression:
+        try:
+            unpack_fun = eval(compression)
+            if prog is not None:
+                new_path = unpack_fun(pathname, working_directory, prog)
+            else:
+                new_path = unpack_fun(pathname, working_directory)
+        except Exception:
+            LOGGER.exception("Could not decompress %s", pathname)
+        else:
+            if delete.lower() in ["1", "yes", "true", "on"]:
+                os.remove(pathname)
+            return new_path
+    return pathname
+
+# Mover
+
+
+def move_it(pathname, destination, attrs=None, hook=None, rel_path=''):
     """Check if the file pointed by *filename* is in the filelist, and move it
     if it is.
     """
@@ -472,8 +608,7 @@ def move_it(message, attrs=None, hook=None):
     pathname = uri.path
     fake_dest = clean_url(dest)
 
-    LOGGER.debug("Copying to: " + fake_dest)
-    dest_url = urlparse(dest)
+    LOGGER.debug("Copying to: %s", fake_dest)
     try:
         mover = MOVERS[dest_url.scheme]
     except KeyError:
@@ -492,8 +627,8 @@ def move_it(message, attrs=None, hook=None):
         LOGGER.debug("".join(traceback.format_tb(exc_traceback)))
         raise err
     else:
-        LOGGER.info("Successfully copied " + pathname + " to " + str(
-            fake_dest))
+        LOGGER.info("Successfully copied %s to %s",
+                    pathname, str(fake_dest))
 
 # TODO: implement the creation of missing directories.
 
@@ -544,6 +679,33 @@ class FileMover(Mover):
         shutil.move(self.origin, self.destination.path)
 
 
+
+class CTimer(Thread):
+    """Call a function after a specified number of seconds:
+    t = CTimer(30.0, f, args=(), kwargs={})
+    t.start()
+    t.cancel() # stop the timer's action if it's still waiting
+    """
+
+    def __init__(self, interval, function, args=(), kwargs={}):
+        Thread.__init__(self)
+        self.interval = interval
+        self.function = function
+        self.args = args
+        self.kwargs = kwargs
+        self.finished = Event()
+
+    def cancel(self):
+        """Stop the timer if it hasn't finished yet"""
+        self.finished.set()
+
+    def run(self):
+        self.finished.wait(self.interval)
+        if not self.finished.is_set():
+            self.function(*self.args, **self.kwargs)
+        self.finished.set()
+
+
 class FtpMover(Mover):
     """Move files over ftp.
     """
@@ -591,6 +753,57 @@ class ScpMover(Mover):
 
     """Move files over ssh with scp.
     """
+    active_connections = dict()
+    active_connection_lock = Lock()
+
+    def open_connection(self):
+        from paramiko import SSHClient, SSHException, AutoAddPolicy
+
+        retries = 3
+        ssh_key_filename = self.attrs.get("ssh_key_filename", None)
+
+        while retries > 0:
+            retries -= 1
+            try:
+                ssh_connection = SSHClient()
+                ssh_connection.set_missing_host_key_policy(AutoAddPolicy())
+                ssh_connection.load_system_host_keys()
+                ssh_connection.connect(self.destination.hostname,
+                                       username=self.destination.username,
+                                       key_filename=ssh_key_filename)
+                LOGGER.debug("Successfully connected to %s as %s",
+                             self.destination.hostname,
+                             self.destination.username)
+            except SSHException as sshe:
+                LOGGER.error("Failed to init SSHClient: %s", str(sshe))
+            except Exception as err:
+                LOGGER.error("Unknown exception at init SSHClient: %s",
+                             str(err))
+            else:
+                return ssh_connection
+
+            ssh_connection.close()
+            time.sleep(2)
+            LOGGER.debug("Retrying ssh connect ...")
+        raise IOError("Failed to ssh connect after 3 attempts")
+
+    @staticmethod
+    def is_connected(connection):
+        LOGGER.debug("checking ssh connection")
+        try:
+            is_active = connection.get_transport().is_active()
+            if is_active:
+                LOGGER.debug("SSH connection is active.")
+            return is_active
+        except AttributeError:
+            return False
+
+    @staticmethod
+    def close_connection(connection):
+        if isinstance(connection, tuple):
+            connection[0].close()
+        else:
+            connection.close()
 
     def move(self):
         """Push it !"""
@@ -617,6 +830,30 @@ class ScpMover(Mover):
         scp.close()
         ssh.close()
 
+        try:
+            scp = SCPClient(ssh_connection.get_transport())
+        except Exception as err:
+            LOGGER.error("Failed to initiate SCPClient: %s", str(err))
+            ssh_connection.close()
+            raise
+
+        try:
+            scp.put(self.origin, self.destination.path)
+        except OSError as osex:
+            if osex.errno == 2:
+                LOGGER.error("No such file or directory. File not transfered: "
+                             "%s. Original error message: %s",
+                             self.origin, str(osex))
+            else:
+                LOGGER.error("OSError in scp.put: %s", str(osex))
+                raise
+        except Exception as err:
+            LOGGER.error("Something went wrong with scp: %s", str(err))
+            LOGGER.error("Exception name %s", type(err).__name__)
+            LOGGER.error("Exception args %s", str(err.args))
+            raise
+        finally:
+            scp.close()
 
 class SftpMover(Mover):
 
@@ -651,7 +888,8 @@ class SftpMover(Mover):
             raise IOError("No available keys")
 
         for key in agent_keys:
-            LOGGER.debug('Trying ssh key %s', key.get_fingerprint().encode('hex'))
+            LOGGER.debug('Trying ssh key %s',
+                         key.get_fingerprint().encode('hex'))
             try:
                 transport.auth_publickey(self.destination.username, key)
                 LOGGER.debug('... ssh key success!')
@@ -764,15 +1002,20 @@ def terminate(chains, publisher=None):
     sys.exit(0)
 
 
-class PollerManager(Thread):
-    """Manage scan Polling thread.
+class PollingManager(Thread):
+    """Manage Polling scan mode thread.
     """
 
     def __init__(self, opath, fun):
+        """
+            Args:
+             opath (string): file pattern corresponding to configured 'origin'
+             fun (functio): thread function
+        """
         Thread.__init__(self)
 
         self._loop = True
-        self.scanPath = opath
+        self.scan_path = opath
         self._fun = fun
         self.timeSleepNoWork = 20
         self._deleter = Deleter()
@@ -782,34 +1025,33 @@ class PollerManager(Thread):
         Thread.start(self)
 
     def run(self):
-        listBefore = dict([(f, None) for f in os.listdir(self.scanPath)])
-        if listBefore: print "Before: ", ", ".join(listBefore)
+        """ Check for new files
+        """
+        list_before = dict([(f, None) for f in os.listdir(self.scan_path)])
         timeSleep = self.timeSleepNoWork
         while self._loop:
             try:
                 time.sleep(timeSleep)
-                listAfter = dict([(f, None) for f in os.listdir(self.scanPath)])
-                listAdded = [f for f in listAfter if not f in listBefore]
-                # removed = [f for f in before if not f in after]
-                if listAdded: print "Added: ", ", ".join(listAdded)
-                if listAdded.__len__() > 0:
-                    print "Found " + str(listAdded.__len__()) + " files"
-                    for key in listAdded:
-                        self._fun(os.path.join(self.scanPath, key))
-
+                list_after = dict([(f, None) for f in os.listdir(self.scan_path)])
+                list_added = [f for f in list_after if not f in list_before]
+                if list_added.__len__() > 0:
+                    for key in list_added:
+                        self._fun(os.path.join(self.scan_path, key))
                     timeSleep = 0
                 else:
                     timeSleep = self.timeSleepNoWork
 
-                listBefore = listAfter
-            except:
-                #restart it
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                LOGGER.debug('Poller thread exception type: %s', str(exc_type))
-                LOGGER.debug('Poller thread exception value: %s', str(exc_value))
+                list_before = list_after
+            except sre_constants.error as err:
+                # FIXME: occasionally found not blocking sre_constants error 
+                LOGGER.debug('Polling thread sre_constants error: %s', str(err))
                 pass
+            except:
+                print("Polling thread unexpected error:", sys.exc_info()[0])
+                raise
+
 
     def stop(self):
-        """Stop the poller manager."""
+        """Stop the polling manager."""
         self._loop = False
         self._deleter.stop()

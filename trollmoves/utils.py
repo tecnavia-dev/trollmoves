@@ -21,21 +21,14 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 import netifaces
 import bz2
-import errno
-import fnmatch
-import glob
 import logging
 import logging.handlers
 import os
 import shutil
 import subprocess
-import sys
-import time
 import traceback
-from ConfigParser import ConfigParser
-from ftplib import FTP, all_errors
-from Queue import Empty, Queue
-from threading import Thread
+import re
+import datetime as dt
 from urlparse import urlparse, urlunparse
 
 import pyinotify
@@ -46,6 +39,8 @@ from posttroll.message import Message
 from posttroll.publisher import get_own_ip
 from trollsift import globify, parse
 
+
+LOGGER = logging.getLogger(__name__)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -150,23 +145,6 @@ def check_output(*popenargs, **kwargs):
         raise RuntimeError(output)
     return output
 
-
-def check_output(*popenargs, **kwargs):
-    """Copy from python 2.7, `subprocess.check_output`."""
-    if 'stdout' in kwargs:
-        raise ValueError('stdout argument not allowed, it will be overridden.')
-    LOGGER.debug("Calling " + str(popenargs))
-    process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
-    output, unused_err = process.communicate()
-    del unused_err
-    retcode = process.poll()
-    if retcode:
-        cmd = kwargs.get("args")
-        if cmd is None:
-            cmd = popenargs[0]
-        raise RuntimeError(output)
-    return output
-
 def xrit(pathname, destination=None, cmd="./xRITDecompress"):
     """Unpacks xrit data."""
     opath, ofile = os.path.split(pathname)
@@ -182,10 +160,9 @@ def xrit(pathname, destination=None, cmd="./xRITDecompress"):
     LOGGER.info("Successfully extracted " + pathname + " to " + destination)
     return expected
 
+
 # bzip
-
 BLOCK_SIZE = 1024
-
 def bzip(origin, destination=None):
     """Unzip files."""
     ofile = os.path.split(origin)[1]
@@ -206,74 +183,250 @@ def bzip(origin, destination=None):
             orig.close()
     return destfile
 
-def unpack(pathname,
-           compression=None,
-           working_directory=None,
-           prog=None,
-           delete="False",
-           **kwargs):
-    """Unpack *pathname*."""
-    del kwargs
-    if compression:
-        try:
-            unpack_fun = eval(compression)
-            if prog is not None:
-                new_path = unpack_fun(pathname, working_directory, prog)
-            else:
-                new_path = unpack_fun(pathname, working_directory)
-        except:
-            LOGGER.exception("Could not decompress " + pathname)
-        else:
-            if delete.lower() in ["1", "yes", "true", "on"]:
-                os.remove(pathname)
-            return new_path
-    return pathname
+def purge_dir(dir_base, destination_size):
+    """ Purge older subdirectories
 
-def purgeDir(dirBase, dirToLeaveSize):
-    # Purge directory to max size
-    toret = 0
-    dest_list = os.listdir(dirBase)
+        Args:
+            dir_base (string): base directory in which subdirectories are generated
+            destination_size (int): maximum number of subdirectories
+
+        Returns:
+            deleted_count (int): number of deleted subdirectories
+    """
+    deleted_count = 0
+    dest_list = os.listdir(dir_base)
     dest_listsubdir = []
     for dest_dir in dest_list:
-        if os.path.isdir(os.path.join(dirBase, dest_dir)):
+        if os.path.isdir(os.path.join(dir_base, dest_dir)):
             dest_listsubdir.append(dest_dir)
-    print "List subdir (" + dirBase + "):"
-    print dest_listsubdir
-    print "Size: " + str(len(dest_listsubdir)) + " To Leave: " + str(dirToLeaveSize)
-    if len(dest_listsubdir) > dirToLeaveSize:
+    LOGGER.debug("Purging subdir: dir found " + str(len(dest_listsubdir)) + " max size " + str(destination_size))
+    if len(dest_listsubdir) > destination_size:
+        # Number of subdirs exceeding maximum size
         dest_listsubdir.sort()
-        print "Sorted destination: "
-        print dest_listsubdir
-        dest_todel = len(dest_listsubdir) - dirToLeaveSize
+        dest_todel = len(dest_listsubdir) - destination_size
         for x in range(0, dest_todel):
-            dest_dirtodel = os.path.join(dirBase, dest_listsubdir[x])
-            print "Todel " + dest_dirtodel
+            dest_dirtodel = os.path.join(dir_base, dest_listsubdir[x])
+            LOGGER.debug("Purging subdir - deleting " + str(dest_dirtodel))
             shutil.rmtree(dest_dirtodel)
-            toret += 1
+            deleted_count += 1
+    else:
+        LOGGER.debug("Purging subdir: No dir to purge")
+    return deleted_count
 
-    return toret
 
-def generateRef(destDir, destFile, destDirRef):
+def purge_files(dir_base, destination_size):
+    # purge older files in ascending order
+    files_list = [os.path.join(dir_base,f) for f in os.listdir(dir_base) if os.path.isfile(os.path.join(dir_base,f))]
+    deleted_count = 0
+    if len(files_list) > destination_size:
+        files_list.sort(key=os.path.getmtime)
+        dest_todel = len(files_list) - destination_size
+        for x in range(0, dest_todel):
+            dest_dirtodel = files_list[x]
+            try:
+                os.remove(dest_dirtodel)
+            except OSError:
+                pass
+            deleted_count += 1
+            LOGGER.debug("Purging files from " + str(dest_dirtodel))
+    return deleted_count
+
+
+def generate_ref(dest_dir, filename, ref_file, filter=None, ref_size=None):
+    """ Generate reference file
+
+        Args:
+            dest_dir: string
+                referenced directory (where satellite data are stored/decompressed)
+            filename: string
+                referenced file name
+            ref_file: string
+                reference file full path
+            filter:
+                filter to detect referenced files
+    """
+    # if ref directory doesn't exist create it
+    pos = ref_file.rfind("/")
+    ref_dir = ref_file[0:pos]
+    if not os.path.exists(ref_dir):
+        try:
+            os.makedirs(ref_dir)
+        except OSError:
+            pass
+
+    # if ref_size is set, purge reference files
+    if ref_size is not None:
+        if os.path.exists(ref_dir):
+            purge_files(ref_dir, int(ref_size))
+
+    if filter is None:
+        filter = ".*"
+    if filter == "*":
+        filter = ".*"
+    pos = filename.find(".bz2")
+    # remove extension from filename
+    if pos >= 0:
+        filename = filename[:pos]
     dest_epistr = "[REF]\r\n"
-    dest_epistr += "SourcePath = " + destDir + "\r\n"
-    dest_epistr += "FileName = " + destFile + "\r\n"
-    dest_epifile = destDirRef + "/" + destFile
-    dest_epifilefp = open(dest_epifile, "w")
+    dest_epistr += "SourcePath = " + dest_dir + "\r\n"
+    dest_epistr += "FileName = " + filename + "\r\n"
+    dest_epistr += "filter = " + filter + "\r\n"
+    dest_epifilefp = open(str(ref_file), "w")
     dest_epifilefp.write(dest_epistr)
     dest_epifilefp.close()
+    return ref_file
 
-    return dest_epifile
 
-def touchRef(destDir, destFile, destDirRef):
-   dest_epifile = None
-   for fname in os.listdir(destDir):
-       if fname.find("-EPI")>0:
-           dest_epifile = destDirRef + "/" + fname
-           destFile = fname
-   if dest_epifile is not None:
-      if os.path.isfile(dest_epifile):
-         #touch the ref file
-         os.remove(dest_epifile)
-         generateRef(destDir, destFile, destDirRef)
+def generate_ref_content(content, ref_file):
+    # Generate ref file writing content string inside
+    dest_epifilefp = open(str(ref_file), "w")
+    dest_epifilefp.write(content)
+    dest_epifilefp.close()
+    return ref_file
 
-# Mover
+
+def trigger_ref_old(dest_dir, ref_filename):
+    """ Trigger reference file: only if epilogue segment is present in data
+
+        Args:
+            dest_dir (string): referenced directory - where satellite data are stored/decompressed
+            ref_filename (string): filename and path of the ref file
+    """
+    dest_epifile = None
+    for fname in os.listdir(dest_dir):
+        if fname.find("-EPI")>0:
+            dest_epifile = ref_filename
+            dest_file = fname
+            break
+    if dest_epifile is not None:
+        if os.path.isfile(dest_epifile):
+            #touch the ref file
+            LOGGER.debug("Retrigger reference file: " + dest_epifile)
+            os.remove(dest_epifile)
+            generate_ref(dest_dir, dest_file, ref_filename)
+
+def trigger_ref(dest_dir, ref_filename):
+    """ Trigger reference file if it already exists
+
+        Args:
+            dest_dir (string): referenced directory - where satellite data are stored/decompressed
+            ref_filename (string): filename and path of the ref file
+    """
+    if ref_filename is not None:
+        if os.path.isfile(ref_filename):
+            #touch the ref file
+            LOGGER.debug("Retrigger reference file: " + ref_filename)
+            ref_file_f = open(ref_filename, "r")
+            read_ref = ref_file_f.read()
+            ref_file_f.close()
+            os.remove(ref_filename)
+            generate_ref_content(read_ref, ref_filename)
+
+
+def is_epilogue(filename):
+    """ Check if filename is an epilogue segment
+    """
+    if filename.find("-EPI") > 0:
+        return True
+    return False
+
+
+def is_file_ref_generator(filename, generate_ref):
+    """
+    Check if the filename triggers generation of ref file
+    :param filename: name of the file received
+    :param generate_ref: pattern describing the file should trigger ref file generation
+                        if "*" all files trigger ref file generation
+    :return: True if ref file should be generated
+             False if ref file should not be generated
+    """
+    if generate_ref == "*":
+        return True
+    else:
+        result = True if filename.find(generate_ref) >= 0 else False
+        return result
+    
+    
+def create_aligned_datetime_var(var_pattern, info_dict):
+    """
+    uses *var_patterns* like "{time:%Y%m%d%H%M|align(15)}"
+    to new datetime including support for temporal
+    alignment (Ceil/Round a datetime object to a multiple of a timedelta.
+    Useful to equalize small time differences in name of files
+    belonging to the same timeslot)
+    """
+    res_dict = None
+    
+    if var_pattern is None:
+        return None
+    
+    mtch = re.match(
+        '{(.*?)(!(.*?))?(\\:(.*?))?(\\|(.*?))?}',
+        var_pattern)
+
+    if mtch is None:
+        return None
+
+    # parse date format pattern
+    key = mtch.groups()[0]
+    # format_spec = mtch.groups()[4]
+    transform = mtch.groups()[6]
+    date_val = info_dict[key]
+
+    if not isinstance(date_val, dt.datetime):
+        return None
+
+    # only for datetime types
+    res = date_val
+    if transform:
+        align_params = _parse_align_time_transform(transform)
+        if align_params:
+            res = align_time(
+                date_val,
+                dt.timedelta(minutes=align_params[0]),
+                dt.timedelta(minutes=align_params[1]),
+                align_params[2])
+    if res:
+        res_dict = {key : res}
+    return res_dict
+
+def _parse_align_time_transform(transform_spec):
+    """
+    Parse the align-time transformation string "align(15,0,-1)"
+    and returns *(steps, offset, intv_add)*
+    """
+    match = re.search('align\\((.*)\\)', transform_spec)
+    if match:
+        al_args = match.group(1).split(',')
+        steps = int(al_args[0])
+        if len(al_args) > 1:
+            offset = int(al_args[1])
+        else:
+            offset = 0
+        if len(al_args) > 2:
+            intv_add = int(al_args[2])
+        else:
+            intv_add = 0
+        return (steps, offset, intv_add)
+    else:
+        return None
+
+
+def align_time(input_val, steps=dt.timedelta(minutes=5),
+               offset=dt.timedelta(minutes=0), intervals_to_add=0):
+    """
+    Ceil/Round a datetime object to a multiple of a timedelta.
+    Useful to equalize small time differences in name of files
+    belonging to the same timeslot
+    """
+    try:
+        stepss = steps.total_seconds()
+    # Python 2.6 compatibility hack
+    except AttributError:
+        stepss = steps.days * 86400. + \
+            steps.seconds + steps.microseconds * 1e-6
+    val = input_val - offset
+    vals = (val - val.min).seconds
+    result = val - dt.timedelta(seconds=(vals - (vals // stepss) * stepss))
+    result = result + (intervals_to_add * steps)
+    return result
