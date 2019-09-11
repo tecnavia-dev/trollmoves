@@ -1,0 +1,33 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: MoveIt Server Goes",
+            "type": "python",
+            "request": "launch",
+            "program": "/data/PyTroll/trollmoves/bin/move_it_server.py",
+            "console": "integratedTerminal",
+            "pythonPath": "/data/PyToCh/PyToCh_develop/bin/python2.7",
+            "args": [
+                "/data/PyToCh/PyToCh_develop/config_files/foreign/trollmoves_server-goes_r.cfg",
+                "-p",
+                "7013"
+            ] 
+        },
+        {
+            "name": "Python: MoveIt Client",
+            "type": "python",
+            "request": "launch",
+            "program": "/data/PyTroll/trollmoves/bin/move_it_client.py",
+            "console": "integratedTerminal",
+            "pythonPath": "/data/PyToCh/PyToCh_develop/bin/python2.7",
+            "args": [
+                "/data/PyToCh/PyToCh_develop/config_files/met11/trollmoves_client-met11.cfg",
+                "-v"
+            ]            
+        }
+    ]
+}
