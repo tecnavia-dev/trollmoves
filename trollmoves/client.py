@@ -280,7 +280,7 @@ def create_destination_dir(msg, destination, destination_subdir=None):
     if destination_subdir is not None:
         # FIXME: Apply real align() function as for trollstalker custom variables
         # If %M|align(10) in destination_subdir: round minutes to the previous 10 minutes
-        if destination_subdir.find("%M|align(10)"):
+        if destination_subdir.find("%M|align(10)") > -1:
             destination_subdir = destination_subdir.replace("%M|align(10)", "%M")
             destination_time = msg.data['nominal_time'].strftime(destination_subdir)
             destination_time = destination_time[:len(destination_time)-1] + "0"
